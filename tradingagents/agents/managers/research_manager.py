@@ -2,11 +2,13 @@ import time
 import json
 
 from tradingagents.agents.utils.agent_utils import build_instrument_context
+from tradingagents.dataflows.config import get_config
 
 
 def create_research_manager(llm, memory):
     def research_manager_node(state) -> dict:
         instrument_context = build_instrument_context(state["company_of_interest"])
+        analysis_timeframe = get_config().get("analysis_timeframe", "1d")
         history = state["investment_debate_state"].get("history", "")
         market_research_report = state["market_report"]
         sentiment_report = state["sentiment_report"]
@@ -31,6 +33,7 @@ Additionally, develop a detailed investment plan for the trader. This should inc
 Your Recommendation: A decisive stance supported by the most convincing arguments.
 Rationale: An explanation of why these arguments lead to your conclusion.
 Strategic Actions: Concrete steps for implementing the recommendation.
+Time Horizon: The configured trading horizon is {analysis_timeframe}. If this is 4h or 1h, prioritize short-term tactical setups, concrete trigger levels, and invalidation that can play out quickly.
 Take into account your past mistakes on similar situations. Use these insights to refine your decision-making and ensure you are learning and improving. Present your analysis conversationally, as if speaking naturally, without special formatting. 
 
 Here are your past reflections on mistakes:

@@ -1,10 +1,13 @@
 from tradingagents.agents.utils.agent_utils import build_instrument_context, get_language_instruction
+from tradingagents.execution import DecisionParseError, DecisionParser
+from tradingagents.dataflows.config import get_config
 
 
 def create_portfolio_manager(llm, memory):
     def portfolio_manager_node(state) -> dict:
 
         instrument_context = build_instrument_context(state["company_of_interest"])
+        analysis_timeframe = get_config().get("analysis_timeframe", "1d")
 
         history = state["risk_debate_state"]["history"]
         risk_debate_state = state["risk_debate_state"]
@@ -21,27 +24,61 @@ def create_portfolio_manager(llm, memory):
         for i, rec in enumerate(past_memories, 1):
             past_memory_str += rec["recommendation"] + "\n\n"
 
+        entry_rules = """- Use `MARKET` only if the trade should be entered immediately at current price.
+- Use `LIMIT` if the trade should wait for one specific price level.
+- Use `LIMIT_ZONE` if the trade should wait for a bounce/retracement/retest zone.
+- For `MARKET`, set `entry_price`, `entry_zone_low`, and `entry_zone_high` to null.
+- For `LIMIT`, set `entry_price` and leave zone fields null.
+- For `LIMIT_ZONE`, set `entry_zone_low` and `entry_zone_high` and leave `entry_price` null."""
+
         prompt = f"""As the Portfolio Manager, synthesize the risk analysts' debate and deliver the final trading decision.
 
 {instrument_context}
 
 ---
 
-**Rating Scale** (use exactly one):
-- **Buy**: Strong conviction to enter or add to position
-- **Overweight**: Favorable outlook, gradually increase exposure
-- **Hold**: Maintain current position, no action needed
-- **Underweight**: Reduce exposure, take partial profits
-- **Sell**: Exit position or avoid entry
+**Action Scale** (use exactly one):
+- **LONG**: Enter or add long exposure
+- **SHORT**: Enter or add short exposure
+- **FLAT**: Stay out or close the existing position
 
 **Context:**
 - Trader's proposed plan: **{trader_plan}**
 - Lessons from past decisions: **{past_memory_str}**
+- Trade date: **{state["trade_date"]}**
+        - Required time horizon for the structured output: **{analysis_timeframe}**
 
 **Required Output Structure:**
-1. **Rating**: State one of Buy / Overweight / Hold / Underweight / Sell.
-2. **Executive Summary**: A concise action plan covering entry strategy, position sizing, key risk levels, and time horizon.
-3. **Investment Thesis**: Detailed reasoning anchored in the analysts' debate and past reflections.
+1. `STRUCTURED_DECISION`
+```json
+{{
+  "symbol": "{state["company_of_interest"]}",
+  "timestamp": "{state["trade_date"]}",
+  "action": "LONG | SHORT | FLAT",
+  "entry_mode": "MARKET | LIMIT | LIMIT_ZONE",
+  "entry_price": null,
+  "entry_zone_low": null,
+  "entry_zone_high": null,
+  "confidence": 0.0,
+  "thesis_summary": "One sentence.",
+  "time_horizon": "{analysis_timeframe}",
+  "stop_loss": 0.0,
+  "take_profit": 0.0,
+  "invalidation": "What would prove the trade wrong.",
+  "size_hint": "small | medium | large"
+}}
+```
+2. `EXECUTIVE_SUMMARY`
+   A concise action plan covering direction, risk levels, and time horizon.
+3. `INVESTMENT_THESIS`
+   Detailed reasoning anchored in the analysts' debate and past reflections.
+
+Rules for the JSON:
+- Output valid JSON only inside the fenced block.
+- Confidence must be between 0 and 1.
+- For `FLAT`, set both `stop_loss` and `take_profit` to null.
+- For `LONG` and `SHORT`, both `stop_loss` and `take_profit` are mandatory numeric prices.
+- {entry_rules}
 
 ---
 
@@ -50,9 +87,19 @@ def create_portfolio_manager(llm, memory):
 
 ---
 
-Be decisive and ground every conclusion in specific evidence from the analysts.{get_language_instruction()}"""
+Be decisive and ground every conclusion in specific evidence from the analysts. If the horizon is 4h or 1h, prefer tactical setups that can trigger and resolve quickly.{get_language_instruction()}"""
 
         response = llm.invoke(prompt)
+        action = {}
+        action_error = ""
+        try:
+            action = DecisionParser.parse(
+                response.content,
+                fallback_symbol=state["company_of_interest"],
+                fallback_timestamp=state["trade_date"],
+            ).model_dump()
+        except DecisionParseError as exc:
+            action_error = str(exc)
 
         new_risk_debate_state = {
             "judge_decision": response.content,
@@ -70,6 +117,8 @@ Be decisive and ground every conclusion in specific evidence from the analysts.{
         return {
             "risk_debate_state": new_risk_debate_state,
             "final_trade_decision": response.content,
+            "final_trade_action": action,
+            "final_trade_action_error": action_error,
         }
 
     return portfolio_manager_node

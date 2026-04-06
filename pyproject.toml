@@ -11,6 +11,8 @@ requires-python = ">=3.10"
 dependencies = [
     "langchain-core>=0.3.81",
     "backtrader>=1.9.78.123",
+    "eth-account>=0.13.7",
+    "hyperliquid-python-sdk>=0.22.0",
     "langchain-anthropic>=0.3.15",
     "langchain-experimental>=0.3.4",
     "langchain-google-genai>=2.1.5",
@@ -33,7 +35,7 @@ dependencies = [
 ]
 
 [project.scripts]
-tradingagents = "cli.main:app"
+tradingagents = "cli.main:main"
 
 [tool.setuptools.packages.find]
 include = ["tradingagents*", "cli*"]

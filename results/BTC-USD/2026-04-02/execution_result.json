@@ -1,0 +1,14 @@
+{
+  "status": "filled",
+  "mode": "paper",
+  "symbol": "BTC",
+  "action": "SHORT",
+  "message": "Paper position opened.",
+  "reference_price": 66944.5,
+  "size": 0.002813,
+  "leverage": 1,
+  "stop_loss": 70500.0,
+  "take_profit": 64700.0,
+  "order_id": null,
+  "raw_response": null
+}

@@ -1,9 +1,21 @@
 from typing import Annotated
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
+import pandas as pd
 import yfinance as yf
 import os
-from .stockstats_utils import StockstatsUtils, _clean_dataframe, yf_retry, load_ohlcv, filter_financials_by_date
+from .stockstats_utils import (
+    StockstatsUtils,
+    _clean_dataframe,
+    filter_financials_by_date,
+    get_analysis_timeframe,
+    get_cutoff_timestamp,
+    get_timeframe_interval,
+    get_timeframe_label,
+    load_ohlcv,
+    resample_ohlcv,
+    yf_retry,
+)
 
 def get_YFin_data_online(
     symbol: Annotated[str, "ticker symbol of the company"],
@@ -11,14 +23,21 @@ def get_YFin_data_online(
     end_date: Annotated[str, "End date in yyyy-mm-dd format"],
 ):
 
-    datetime.strptime(start_date, "%Y-%m-%d")
-    datetime.strptime(end_date, "%Y-%m-%d")
+    start_ts = pd.to_datetime(start_date)
+    end_ts = pd.to_datetime(end_date)
+
+    timeframe = get_analysis_timeframe()
+    interval = get_timeframe_interval()
 
     # Create ticker object
     ticker = yf.Ticker(symbol.upper())
 
     # Fetch historical data for the specified date range
-    data = yf_retry(lambda: ticker.history(start=start_date, end=end_date))
+    history_end = end_date
+    if timeframe in ("1h", "4h") and len(str(end_date).strip()) <= 10:
+        end_dt = end_ts + relativedelta(days=1)
+        history_end = end_dt.strftime("%Y-%m-%d")
+    data = yf_retry(lambda: ticker.history(start=start_ts.strftime("%Y-%m-%d"), end=history_end, interval=interval))
 
     # Check if data is empty
     if data.empty:
@@ -30,6 +49,12 @@ def get_YFin_data_online(
     if data.index.tz is not None:
         data.index = data.index.tz_localize(None)
 
+    data = data.reset_index()
+    data = _clean_dataframe(data)
+    data = resample_ohlcv(data, timeframe)
+    data = data[data["Date"] <= get_cutoff_timestamp(end_date)]
+    data = data[data["Date"] >= start_ts]
+
     # Round numerical values to 2 decimal places for cleaner display
     numeric_columns = ["Open", "High", "Low", "Close", "Adj Close"]
     for col in numeric_columns:
@@ -37,10 +62,10 @@ def get_YFin_data_online(
             data[col] = data[col].round(2)
 
     # Convert DataFrame to CSV string
-    csv_string = data.to_csv()
+    csv_string = data.to_csv(index=False)
 
     # Add header information
-    header = f"# Stock data for {symbol.upper()} from {start_date} to {end_date}\n"
+    header = f"# Stock data for {symbol.upper()} from {start_date} to {end_date} using {get_timeframe_label()} bars\n"
     header += f"# Total records: {len(data)}\n"
     header += f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
 
@@ -134,28 +159,31 @@ def get_stock_stats_indicators_window(
         )
 
     end_date = curr_date
-    curr_date_dt = datetime.strptime(curr_date, "%Y-%m-%d")
+    curr_date_dt = pd.to_datetime(curr_date).to_pydatetime()
     before = curr_date_dt - relativedelta(days=look_back_days)
+    timeframe = get_analysis_timeframe()
 
     # Optimized: Get stock data once and calculate indicators for all dates
     try:
         indicator_data = _get_stock_stats_bulk(symbol, indicator, curr_date)
-        
-        # Generate the date range we need
-        current_dt = curr_date_dt
+
         date_values = []
-        
-        while current_dt >= before:
-            date_str = current_dt.strftime('%Y-%m-%d')
-            
-            # Look up the indicator value for this date
-            if date_str in indicator_data:
-                indicator_value = indicator_data[date_str]
-            else:
-                indicator_value = "N/A: Not a trading day (weekend or holiday)"
-            
-            date_values.append((date_str, indicator_value))
-            current_dt = current_dt - relativedelta(days=1)
+        if timeframe in ("1h", "4h"):
+            for date_str, value in indicator_data.items():
+                dt = datetime.fromisoformat(date_str)
+                if before <= dt <= get_cutoff_timestamp(curr_date).to_pydatetime():
+                    date_values.append((date_str, value))
+            date_values = date_values[-30:]
+        else:
+            current_dt = curr_date_dt
+            while current_dt >= before:
+                date_str = current_dt.strftime('%Y-%m-%d')
+                if date_str in indicator_data:
+                    indicator_value = indicator_data[date_str]
+                else:
+                    indicator_value = "N/A: Not a trading day (weekend or holiday)"
+                date_values.append((date_str, indicator_value))
+                current_dt = current_dt - relativedelta(days=1)
         
         # Build the result string
         ind_string = ""
@@ -166,16 +194,16 @@ def get_stock_stats_indicators_window(
         print(f"Error getting bulk stockstats data: {e}")
         # Fallback to original implementation if bulk method fails
         ind_string = ""
-        curr_date_dt = datetime.strptime(curr_date, "%Y-%m-%d")
+        curr_date_dt = pd.to_datetime(curr_date).to_pydatetime()
         while curr_date_dt >= before:
             indicator_value = get_stockstats_indicator(
-                symbol, indicator, curr_date_dt.strftime("%Y-%m-%d")
+                symbol, indicator, curr_date_dt.isoformat(sep=" ", timespec="minutes")
             )
-            ind_string += f"{curr_date_dt.strftime('%Y-%m-%d')}: {indicator_value}\n"
+            ind_string += f"{curr_date_dt.strftime('%Y-%m-%d %H:%M' if timeframe in ('1h', '4h') else '%Y-%m-%d')}: {indicator_value}\n"
             curr_date_dt = curr_date_dt - relativedelta(days=1)
 
     result_str = (
-        f"## {indicator} values from {before.strftime('%Y-%m-%d')} to {end_date}:\n\n"
+        f"## {indicator} values from {before.strftime('%Y-%m-%d')} to {end_date} using {get_timeframe_label()} bars:\n\n"
         + ind_string
         + "\n\n"
         + best_ind_params.get(indicator, "No description available.")
@@ -198,7 +226,11 @@ def _get_stock_stats_bulk(
 
     data = load_ohlcv(symbol, curr_date)
     df = wrap(data)
-    df["Date"] = df["Date"].dt.strftime("%Y-%m-%d")
+    timeframe = get_analysis_timeframe()
+    if timeframe in ("1h", "4h"):
+        df["Date"] = df["Date"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        df["Date"] = df["Date"].dt.strftime("%Y-%m-%d")
     
     # Calculate the indicator for all rows at once
     df[indicator]  # This triggers stockstats to calculate the indicator
@@ -226,8 +258,8 @@ def get_stockstats_indicator(
     ],
 ) -> str:
 
-    curr_date_dt = datetime.strptime(curr_date, "%Y-%m-%d")
-    curr_date = curr_date_dt.strftime("%Y-%m-%d")
+    curr_date_dt = pd.to_datetime(curr_date).to_pydatetime()
+    curr_date = curr_date_dt.isoformat(sep=" ", timespec="minutes") if get_analysis_timeframe() in ("1h", "4h") else curr_date_dt.strftime("%Y-%m-%d")
 
     try:
         indicator_value = StockstatsUtils.get_stock_stats(

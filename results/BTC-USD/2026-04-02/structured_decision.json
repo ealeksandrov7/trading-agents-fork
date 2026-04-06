@@ -1,0 +1,12 @@
+{
+  "symbol": "BTC",
+  "timestamp": "2026-04-02",
+  "action": "SHORT",
+  "confidence": 0.62,
+  "thesis_summary": "The failed mid-March recovery attempt at $75,988, MACD rolling back below zero, and price sitting below both the 50 SMA and Bollinger Middle Band confirm seller control in an established downtrend, making a short entry on intraday bounce the highest-probability trade.",
+  "time_horizon": "1d",
+  "stop_loss": 70500.0,
+  "take_profit": 64700.0,
+  "invalidation": "A decisive daily close above $70,500, which would simultaneously breach the 50 SMA and Bollinger Middle Band and genuinely invalidate the failed-recovery bear thesis.",
+  "size_hint": "medium"
+}

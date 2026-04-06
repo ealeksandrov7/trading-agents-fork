@@ -1,5 +1,6 @@
 from typing import Optional
 import datetime
+import json
 import typer
 from pathlib import Path
 from functools import wraps
@@ -25,6 +26,17 @@ from rich.rule import Rule
 
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.execution import (
+    ExecutionMode,
+    HyperliquidExecutionError,
+    HyperliquidExecutor,
+    OrderIntent,
+    OrderPreview,
+    OrderStatus,
+    PaperBroker,
+    RiskEngine,
+    RiskEvaluationError,
+)
 from cli.models import AnalystType
 from cli.utils import *
 from cli.announcements import fetch_announcements, display_announcements
@@ -513,7 +525,7 @@ def get_user_selections():
     console.print(
         create_question_box(
             "Step 2: Analysis Date",
-            "Enter the analysis date (YYYY-MM-DD)",
+            "Enter the analysis date or timestamp (YYYY-MM-DD or YYYY-MM-DD HH:MM)",
             default_date,
         )
     )
@@ -617,22 +629,28 @@ def get_ticker():
 
 
 def get_analysis_date():
-    """Get the analysis date from user input."""
+    """Get the analysis timestamp from user input."""
     while True:
         date_str = typer.prompt(
             "", default=datetime.datetime.now().strftime("%Y-%m-%d")
         )
         try:
-            # Validate date format and ensure it's not in the future
-            analysis_date = datetime.datetime.strptime(date_str, "%Y-%m-%d")
-            if analysis_date.date() > datetime.datetime.now().date():
-                console.print("[red]Error: Analysis date cannot be in the future[/red]")
+            analysis_date = datetime.datetime.fromisoformat(date_str.replace("T", " "))
+            if analysis_date > datetime.datetime.now():
+                console.print("[red]Error: Analysis timestamp cannot be in the future[/red]")
                 continue
-            return date_str
+            return analysis_date.isoformat(sep=" ", timespec="minutes")
         except ValueError:
-            console.print(
-                "[red]Error: Invalid date format. Please use YYYY-MM-DD[/red]"
-            )
+            try:
+                analysis_date = datetime.datetime.strptime(date_str, "%Y-%m-%d")
+                if analysis_date.date() > datetime.datetime.now().date():
+                    console.print("[red]Error: Analysis date cannot be in the future[/red]")
+                    continue
+                return date_str
+            except ValueError:
+                console.print(
+                    "[red]Error: Invalid format. Please use YYYY-MM-DD or YYYY-MM-DD HH:MM[/red]"
+                )
 
 
 def save_report_to_disk(final_state, ticker: str, save_path: Path):
@@ -925,10 +943,10 @@ def format_tool_args(args, max_length=80) -> str:
         return result[:max_length - 3] + "..."
     return result
 
-def run_analysis():
-    # First get all user selections
-    selections = get_user_selections()
-
+def build_runtime_config(selections: dict) -> dict:
+    timeframe = selections.get("analysis_timeframe", "1d").lower()
+    if timeframe not in {"1d", "4h", "1h"}:
+        raise typer.BadParameter("Timeframe must be one of: 1d, 4h, 1h.")
     # Create config with selected research depth
     config = DEFAULT_CONFIG.copy()
     config["max_debate_rounds"] = selections["research_depth"]
@@ -942,6 +960,13 @@ def run_analysis():
     config["openai_reasoning_effort"] = selections.get("openai_reasoning_effort")
     config["anthropic_effort"] = selections.get("anthropic_effort")
     config["output_language"] = selections.get("output_language", "English")
+    config["analysis_timeframe"] = timeframe
+    config["decision_timeframe"] = config["analysis_timeframe"]
+    return config
+
+
+def run_analysis_session(selections: dict):
+    config = build_runtime_config(selections)
 
     # Create stats callback handler for tracking LLM/tool calls
     stats_handler = StatsCallbackHandler()
@@ -1027,6 +1052,9 @@ def run_analysis():
         message_buffer.add_message(
             "System",
             f"Selected analysts: {', '.join(analyst.value for analyst in selections['analysts'])}",
+        )
+        message_buffer.add_message(
+            "System", f"Analysis timeframe: {selections['analysis_timeframe']}"
         )
         update_display(layout, stats_handler=stats_handler, start_time=start_time)
 
@@ -1173,6 +1201,223 @@ def run_analysis():
 
         update_display(layout, stats_handler=stats_handler, start_time=start_time)
 
+    return {
+        "selections": selections,
+        "config": config,
+        "final_state": final_state,
+        "decision": decision,
+        "results_dir": results_dir,
+    }
+
+
+def prompt_execution_mode() -> ExecutionMode:
+    choice = typer.prompt(
+        "Execution mode [analysis/paper/live]",
+        default=DEFAULT_CONFIG["execution_mode"],
+    ).strip().lower()
+    try:
+        return ExecutionMode(choice)
+    except ValueError as exc:
+        raise typer.BadParameter("Execution mode must be analysis, paper, or live.") from exc
+
+
+def prompt_bankroll() -> float:
+    bankroll = float(typer.prompt("Bankroll in USD", default="1000"))
+    if bankroll <= 0:
+        raise typer.BadParameter("Bankroll must be positive.")
+    return bankroll
+
+
+def print_structured_decision(final_state: dict) -> None:
+    action = final_state.get("final_trade_action") or {}
+    if not action:
+        error = final_state.get("final_trade_action_error") or "No structured action was generated."
+        console.print(f"[red]Structured decision unavailable:[/red] {error}")
+        return
+
+    table = Table(show_header=False, box=box.SIMPLE, padding=(0, 1))
+    table.add_column("Field", style="cyan")
+    table.add_column("Value", style="white")
+    for key in (
+        "symbol",
+        "action",
+        "entry_mode",
+        "entry_price",
+        "entry_zone_low",
+        "entry_zone_high",
+        "confidence",
+        "time_horizon",
+        "stop_loss",
+        "take_profit",
+        "invalidation",
+        "size_hint",
+    ):
+        table.add_row(key, str(action.get(key)))
+    console.print(Panel(table, title="Structured Decision", border_style="green"))
+
+
+def print_order_preview(intent: OrderIntent, preview: Optional[OrderPreview] = None) -> None:
+    table = Table(show_header=False, box=box.SIMPLE, padding=(0, 1))
+    table.add_column("Field", style="cyan")
+    table.add_column("Value", style="white")
+    table.add_row("Mode", intent.mode.value)
+    table.add_row("Symbol", intent.symbol)
+    table.add_row("Action", intent.action.value)
+    table.add_row("Entry Mode", str(intent.entry_mode))
+    table.add_row("Limit Price", str(intent.limit_price))
+    table.add_row("Limit Zone Low", str(intent.limit_zone_low))
+    table.add_row("Limit Zone High", str(intent.limit_zone_high))
+    table.add_row("Size", f"{intent.size:.6f}")
+    table.add_row("Reference Price", f"{intent.reference_price:.2f}")
+    table.add_row("Leverage", f"{intent.leverage}x")
+    table.add_row("Stop Loss", str(intent.stop_loss))
+    table.add_row("Take Profit", str(intent.take_profit))
+    table.add_row("Confidence", f"{intent.confidence:.2f}")
+    table.add_row("Thesis", intent.thesis_summary)
+    if preview:
+        table.add_row("Status", preview.status.value)
+        table.add_row("Message", preview.message)
+    console.print(Panel(table, title="Execution Preview", border_style="yellow"))
+
+
+def persist_execution_artifacts(
+    results_dir: Path,
+    final_state: dict,
+    intent: Optional[OrderIntent] = None,
+    preview: Optional[OrderPreview] = None,
+) -> None:
+    if final_state.get("final_trade_action"):
+        (results_dir / "structured_decision.json").write_text(
+            json.dumps(final_state["final_trade_action"], indent=2)
+        )
+    if final_state.get("final_trade_action_error"):
+        (results_dir / "structured_decision_error.txt").write_text(
+            final_state["final_trade_action_error"]
+        )
+    if intent:
+        (results_dir / "order_intent.json").write_text(
+            json.dumps(intent.model_dump(), indent=2)
+        )
+    if preview:
+        (results_dir / "execution_result.json").write_text(
+            json.dumps(preview.model_dump(), indent=2)
+        )
+
+
+def execute_trade_flow(analysis_result: dict) -> None:
+    selections = analysis_result["selections"]
+    config = analysis_result["config"]
+    final_state = analysis_result["final_state"]
+    results_dir = analysis_result["results_dir"]
+
+    console.print("\n[bold cyan]Analysis Complete![/bold cyan]\n")
+    print_structured_decision(final_state)
+
+    action = final_state.get("final_trade_action") or {}
+    if not action:
+        persist_execution_artifacts(results_dir, final_state)
+        console.print("[red]Execution blocked because the structured decision is invalid.[/red]")
+        return
+
+    execution_mode = prompt_execution_mode()
+    bankroll = prompt_bankroll()
+    config["execution_mode"] = execution_mode.value
+
+    executor = HyperliquidExecutor(
+        wallet_address=config.get("hyperliquid_wallet_address"),
+        base_url=config.get("hyperliquid_base_url"),
+    )
+
+    try:
+        reference_price = executor.get_mark_price(action["symbol"])
+    except HyperliquidExecutionError as exc:
+        console.print(f"[red]Unable to fetch Hyperliquid price:[/red] {exc}")
+        persist_execution_artifacts(results_dir, final_state)
+        return
+
+    open_position = None
+    if execution_mode == ExecutionMode.PAPER:
+        paper_broker = PaperBroker(Path(config["paper_ledger_path"]))
+        open_position = paper_broker.get_open_position()
+    else:
+        open_position = executor.get_open_position()
+
+    risk_engine = RiskEngine(
+        bankroll=bankroll,
+        max_risk_per_trade_pct=config["max_risk_per_trade_pct"],
+        max_leverage=config["max_leverage"],
+        allowed_symbols=tuple(config["allowed_symbols"]),
+        single_position_mode=config["single_position_mode"],
+        decision_timeframe=config["decision_timeframe"],
+    )
+
+    try:
+        intent = risk_engine.build_order_intent(
+            final_state["final_trade_action"],
+            reference_price=reference_price,
+            mode=execution_mode,
+            open_position=open_position,
+        )
+    except RiskEvaluationError as exc:
+        console.print(f"[red]Trade rejected by risk engine:[/red] {exc}")
+        persist_execution_artifacts(results_dir, final_state)
+        return
+
+    preview = OrderPreview(
+        status=OrderStatus.PREVIEW,
+        mode=execution_mode,
+        symbol=intent.symbol,
+        action=intent.action,
+        message="Ready for execution.",
+        reference_price=intent.reference_price,
+        size=intent.size,
+        leverage=intent.leverage,
+        stop_loss=intent.stop_loss,
+        take_profit=intent.take_profit,
+    )
+    print_order_preview(intent, preview)
+
+    if execution_mode == ExecutionMode.ANALYSIS:
+        persist_execution_artifacts(results_dir, final_state, intent, preview)
+        return
+
+    if execution_mode == ExecutionMode.LIVE:
+        confirmed = typer.confirm("Place this live Hyperliquid order?", default=False)
+        if not confirmed:
+            preview = OrderPreview(
+                status=OrderStatus.SKIPPED,
+                mode=execution_mode,
+                symbol=intent.symbol,
+                action=intent.action,
+                message="Live order cancelled by operator.",
+            )
+            persist_execution_artifacts(results_dir, final_state, intent, preview)
+            console.print("[yellow]Live execution cancelled.[/yellow]")
+            return
+        try:
+            preview = executor.execute(intent)
+        except HyperliquidExecutionError as exc:
+            preview = OrderPreview(
+                status=OrderStatus.ERROR,
+                mode=execution_mode,
+                symbol=intent.symbol,
+                action=intent.action,
+                message=str(exc),
+            )
+    else:
+        preview = paper_broker.execute(intent)
+
+    persist_execution_artifacts(results_dir, final_state, intent, preview)
+    print_order_preview(intent, preview)
+
+
+def run_analysis(timeframe: str = "1d"):
+    # First get all user selections
+    selections = get_user_selections()
+    selections["analysis_timeframe"] = timeframe
+    analysis_result = run_analysis_session(selections)
+    final_state = analysis_result["final_state"]
+
     # Post-analysis prompts (outside Live context for clean interaction)
     console.print("\n[bold cyan]Analysis Complete![/bold cyan]\n")
 
@@ -1200,9 +1445,33 @@ def run_analysis():
 
 
 @app.command()
-def analyze():
-    run_analysis()
+def analyze(
+    timeframe: str = typer.Option(
+        "1d",
+        "--timeframe",
+        help="Signal generation timeframe. Supported values: 1d, 4h, 1h.",
+    ),
+):
+    run_analysis(timeframe=timeframe)
+
+
+@app.command()
+def trade(
+    timeframe: str = typer.Option(
+        "4h",
+        "--timeframe",
+        help="Signal generation timeframe. Supported values: 1d, 4h, 1h.",
+    ),
+):
+    selections = get_user_selections()
+    selections["analysis_timeframe"] = timeframe
+    analysis_result = run_analysis_session(selections)
+    execute_trade_flow(analysis_result)
+
+
+def main():
+    app(prog_name="tradingagents")
 
 
 if __name__ == "__main__":
-    app()
+    main()

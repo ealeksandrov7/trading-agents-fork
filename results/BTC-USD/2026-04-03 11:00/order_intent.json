@@ -1,0 +1,21 @@
+{
+  "mode": "paper",
+  "symbol": "BTC",
+  "action": "SHORT",
+  "size": 0.013333,
+  "reference_price": 67124.5,
+  "entry_mode": "LIMIT_ZONE",
+  "limit_price": null,
+  "limit_zone_low": 67500.0,
+  "limit_zone_high": 68000.0,
+  "leverage": 1,
+  "stop_loss": 68500.0,
+  "take_profit": 64000.0,
+  "confidence": 0.52,
+  "thesis_summary": "Descending channel structure with trapped overhead supply and low-volume consolidation below resistance favors a tactical short on a bounce into the $67,500\u2013$68,000 resistance zone with tight invalidation.",
+  "time_horizon": "1h",
+  "invalidation": "Convincing hourly close above $68,500 with meaningful volume expansion confirms the bull coiled-spring breakout and negates the descending channel thesis.",
+  "decision_timestamp": "2026-04-03 11:00",
+  "rationale": "Accepted by deterministic risk engine.",
+  "reduce_only": false
+}

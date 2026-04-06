@@ -1,0 +1,14 @@
+{
+  "status": "preview",
+  "mode": "paper",
+  "symbol": "BTC",
+  "action": "SHORT",
+  "message": "Paper limit order staged but not filled at the current price.",
+  "reference_price": 67124.5,
+  "size": 0.013333,
+  "leverage": 1,
+  "stop_loss": 68500.0,
+  "take_profit": 64000.0,
+  "order_id": null,
+  "raw_response": null
+}

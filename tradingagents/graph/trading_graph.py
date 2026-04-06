@@ -256,6 +256,8 @@ class TradingAgentsGraph:
             },
             "investment_plan": final_state["investment_plan"],
             "final_trade_decision": final_state["final_trade_decision"],
+            "final_trade_action": final_state.get("final_trade_action", {}),
+            "final_trade_action_error": final_state.get("final_trade_action_error", ""),
         }
 
         # Save to file
@@ -287,6 +289,10 @@ class TradingAgentsGraph:
             self.curr_state, returns_losses, self.portfolio_manager_memory
         )
 
-    def process_signal(self, full_signal):
+    def process_signal(self, full_signal, symbol=None, trade_date=None):
         """Process a signal to extract the core decision."""
-        return self.signal_processor.process_signal(full_signal)
+        return self.signal_processor.process_signal(
+            full_signal,
+            symbol=symbol or self.ticker,
+            trade_date=trade_date,
+        )

@@ -19,10 +19,24 @@ DEFAULT_CONFIG = {
     # Output language for analyst reports and final decision
     # Internal agent debate stays in English for reasoning quality
     "output_language": "English",
+    "analysis_timeframe": "1d",
     # Debate and discussion settings
     "max_debate_rounds": 1,
     "max_risk_discuss_rounds": 1,
     "max_recur_limit": 100,
+    # Execution settings
+    "execution_mode": os.getenv("TRADINGAGENTS_EXECUTION_MODE", "analysis"),
+    "allowed_symbols": ["BTC", "ETH"],
+    "decision_timeframe": "4h",
+    "max_risk_per_trade_pct": 0.01,
+    "max_leverage": 2,
+    "single_position_mode": True,
+    "require_manual_live_confirm": True,
+    "paper_ledger_path": os.getenv(
+        "TRADINGAGENTS_PAPER_LEDGER_PATH", "./results/paper_ledger.json"
+    ),
+    "hyperliquid_base_url": os.getenv("HYPERLIQUID_BASE_URL"),
+    "hyperliquid_wallet_address": os.getenv("HYPERLIQUID_WALLET_ADDRESS"),
     # Data vendor configuration
     # Category-level configuration (default for all tools in category)
     "data_vendors": {

@@ -12,6 +12,65 @@ from .config import get_config
 logger = logging.getLogger(__name__)
 
 
+def get_analysis_timeframe() -> str:
+    return get_config().get("analysis_timeframe", "1d").lower()
+
+
+def get_timeframe_interval() -> str:
+    timeframe = get_analysis_timeframe()
+    return "1h" if timeframe in ("1h", "4h") else "1d"
+
+
+def get_timeframe_label() -> str:
+    timeframe = get_analysis_timeframe()
+    if timeframe in ("1h", "4h"):
+        return timeframe
+    return "1d"
+
+
+def get_cutoff_timestamp(curr_date: str) -> pd.Timestamp:
+    curr_ts = pd.to_datetime(curr_date)
+    if len(str(curr_date).strip()) > 10:
+        return curr_ts
+    timeframe = get_analysis_timeframe()
+    if timeframe in ("1h", "4h"):
+        return curr_ts + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+    return curr_ts
+
+
+def resample_ohlcv(data: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+    if timeframe == "1h":
+        return data
+    if timeframe != "4h":
+        return data
+
+    if data.empty:
+        return data
+
+    frame = data.copy()
+    frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
+    frame = frame.dropna(subset=["Date"]).sort_values("Date")
+    frame = frame.set_index("Date")
+
+    agg_map = {
+        "Open": "first",
+        "High": "max",
+        "Low": "min",
+        "Close": "last",
+        "Volume": "sum",
+    }
+    if "Adj Close" in frame.columns:
+        agg_map["Adj Close"] = "last"
+
+    resampled = (
+        frame.resample("4h", label="right", closed="right")
+        .agg(agg_map)
+        .dropna(subset=["Open", "High", "Low", "Close"])
+        .reset_index()
+    )
+    return resampled
+
+
 def yf_retry(func, max_retries=3, base_delay=2.0):
     """Execute a yfinance call with exponential backoff on rate limits.
 
@@ -33,6 +92,12 @@ def yf_retry(func, max_retries=3, base_delay=2.0):
 
 def _clean_dataframe(data: pd.DataFrame) -> pd.DataFrame:
     """Normalize a stock DataFrame for stockstats: parse dates, drop invalid rows, fill price gaps."""
+    if "Date" not in data.columns:
+        if "Datetime" in data.columns:
+            data = data.rename(columns={"Datetime": "Date"})
+        elif "index" in data.columns:
+            data = data.rename(columns={"index": "Date"})
+
     data["Date"] = pd.to_datetime(data["Date"], errors="coerce")
     data = data.dropna(subset=["Date"])
 
@@ -52,18 +117,23 @@ def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
     filtered out so backtests never see future prices.
     """
     config = get_config()
-    curr_date_dt = pd.to_datetime(curr_date)
+    curr_date_dt = get_cutoff_timestamp(curr_date)
+    timeframe = get_analysis_timeframe()
+    interval = get_timeframe_interval()
 
     # Cache uses a fixed window (15y to today) so one file per symbol
     today_date = pd.Timestamp.today()
-    start_date = today_date - pd.DateOffset(years=5)
+    if timeframe in ("1h", "4h"):
+        start_date = today_date - pd.DateOffset(days=729)
+    else:
+        start_date = today_date - pd.DateOffset(years=5)
     start_str = start_date.strftime("%Y-%m-%d")
     end_str = today_date.strftime("%Y-%m-%d")
 
     os.makedirs(config["data_cache_dir"], exist_ok=True)
     data_file = os.path.join(
         config["data_cache_dir"],
-        f"{symbol}-YFin-data-{start_str}-{end_str}.csv",
+        f"{symbol}-YFin-data-{interval}-{start_str}-{end_str}.csv",
     )
 
     if os.path.exists(data_file):
@@ -73,6 +143,7 @@ def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
             symbol,
             start=start_str,
             end=end_str,
+            interval=interval,
             multi_level_index=False,
             progress=False,
             auto_adjust=True,
@@ -81,6 +152,7 @@ def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
         data.to_csv(data_file, index=False)
 
     data = _clean_dataframe(data)
+    data = resample_ohlcv(data, timeframe)
 
     # Filter to curr_date to prevent look-ahead bias in backtesting
     data = data[data["Date"] <= curr_date_dt]
@@ -115,11 +187,16 @@ class StockstatsUtils:
     ):
         data = load_ohlcv(symbol, curr_date)
         df = wrap(data)
-        df["Date"] = df["Date"].dt.strftime("%Y-%m-%d")
-        curr_date_str = pd.to_datetime(curr_date).strftime("%Y-%m-%d")
+        timeframe = get_analysis_timeframe()
+        cutoff = get_cutoff_timestamp(curr_date)
 
         df[indicator]  # trigger stockstats to calculate the indicator
-        matching_rows = df[df["Date"].str.startswith(curr_date_str)]
+        if timeframe in ("1h", "4h"):
+            matching_rows = df[df["Date"] <= cutoff].tail(1)
+        else:
+            curr_date_str = pd.to_datetime(curr_date).strftime("%Y-%m-%d")
+            df["Date"] = df["Date"].dt.strftime("%Y-%m-%d")
+            matching_rows = df[df["Date"].str.startswith(curr_date_str)]
 
         if not matching_rows.empty:
             indicator_value = matching_rows[indicator].values[0]
