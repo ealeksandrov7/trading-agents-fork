@@ -28,8 +28,28 @@ def get_timeframe_label() -> str:
     return "1d"
 
 
+def get_indicator_analysis_window_days(timeframe: str | None = None) -> int:
+    timeframe = (timeframe or get_analysis_timeframe()).lower()
+    if timeframe == "1h":
+        return 5
+    if timeframe == "4h":
+        return 10
+    return 30
+
+
+def get_indicator_compute_window_days(timeframe: str | None = None) -> int:
+    timeframe = (timeframe or get_analysis_timeframe()).lower()
+    if timeframe == "1h":
+        return 21
+    if timeframe == "4h":
+        return 60
+    return 365 * 5
+
+
 def get_cutoff_timestamp(curr_date: str) -> pd.Timestamp:
     curr_ts = pd.to_datetime(curr_date)
+    if getattr(curr_ts, "tzinfo", None) is not None:
+        curr_ts = curr_ts.tz_localize(None)
     if len(str(curr_date).strip()) > 10:
         return curr_ts
     timeframe = get_analysis_timeframe()
@@ -99,6 +119,8 @@ def _clean_dataframe(data: pd.DataFrame) -> pd.DataFrame:
             data = data.rename(columns={"index": "Date"})
 
     data["Date"] = pd.to_datetime(data["Date"], errors="coerce")
+    if hasattr(data["Date"], "dt") and getattr(data["Date"].dt, "tz", None) is not None:
+        data["Date"] = data["Date"].dt.tz_localize(None)
     data = data.dropna(subset=["Date"])
 
     price_cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in data.columns]
@@ -109,7 +131,7 @@ def _clean_dataframe(data: pd.DataFrame) -> pd.DataFrame:
     return data
 
 
-def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
+def load_ohlcv(symbol: str, curr_date: str, timeframe_override: str | None = None) -> pd.DataFrame:
     """Fetch OHLCV data with caching, filtered to prevent look-ahead bias.
 
     Downloads 15 years of data up to today and caches per symbol. On
@@ -118,15 +140,16 @@ def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
     """
     config = get_config()
     curr_date_dt = get_cutoff_timestamp(curr_date)
-    timeframe = get_analysis_timeframe()
-    interval = get_timeframe_interval()
+    timeframe = (timeframe_override or get_analysis_timeframe()).lower()
+    interval = "1h" if timeframe in ("1h", "4h") else "1d"
 
     # Cache uses a fixed window (15y to today) so one file per symbol
     today_date = pd.Timestamp.today()
+    compute_days = get_indicator_compute_window_days(timeframe)
     if timeframe in ("1h", "4h"):
-        start_date = today_date - pd.DateOffset(days=729)
+        start_date = today_date - pd.DateOffset(days=compute_days)
     else:
-        start_date = today_date - pd.DateOffset(years=5)
+        start_date = today_date - pd.DateOffset(days=compute_days)
     start_str = start_date.strftime("%Y-%m-%d")
     end_str = today_date.strftime("%Y-%m-%d")
 

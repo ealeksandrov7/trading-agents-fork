@@ -1,4 +1,5 @@
 from tradingagents.agents.utils.agent_utils import build_instrument_context, get_language_instruction
+from tradingagents.agents.utils.prompt_utils import compact_history, compact_memories, compact_text
 from tradingagents.execution import DecisionParseError, DecisionParser
 from tradingagents.dataflows.config import get_config
 
@@ -7,9 +8,11 @@ def create_portfolio_manager(llm, memory):
     def portfolio_manager_node(state) -> dict:
 
         instrument_context = build_instrument_context(state["company_of_interest"])
-        analysis_timeframe = get_config().get("analysis_timeframe", "1d")
+        config = get_config()
+        analysis_timeframe = config.get("analysis_timeframe", "1d")
 
         history = state["risk_debate_state"]["history"]
+        summary = state["risk_debate_state"].get("summary", "")
         risk_debate_state = state["risk_debate_state"]
         market_research_report = state["market_report"]
         news_report = state["news_report"]
@@ -21,8 +24,23 @@ def create_portfolio_manager(llm, memory):
         past_memories = memory.get_memories(curr_situation, n_matches=2)
 
         past_memory_str = ""
-        for i, rec in enumerate(past_memories, 1):
+        for rec in past_memories:
             past_memory_str += rec["recommendation"] + "\n\n"
+
+        if config.get("compact_reasoning", True):
+            debate_history = compact_history(
+                summary or history,
+                max_chars=config.get("compact_history_max_chars", 1200),
+            )
+            lessons = compact_memories(
+                past_memory_str,
+                max_chars=config.get("compact_memory_max_chars", 500),
+            )
+            trader_plan_context = compact_text(trader_plan, max_chars=1200, max_lines=16)
+        else:
+            debate_history = history
+            lessons = past_memory_str
+            trader_plan_context = trader_plan
 
         entry_rules = """- Use `MARKET` only if the trade should be entered immediately at current price.
 - Use `LIMIT` if the trade should wait for one specific price level.
@@ -45,8 +63,8 @@ Your highest priority is format compliance. You must output the `STRUCTURED_DECI
 - **FLAT**: Stay out or close the existing position
 
 **Context:**
-- Trader's proposed plan: **{trader_plan}**
-- Lessons from past decisions: **{past_memory_str}**
+- Trader's proposed plan: **{trader_plan_context}**
+- Lessons from past decisions: **{lessons}**
 - Trade date: **{state["trade_date"]}**
         - Required time horizon for the structured output: **{analysis_timeframe}**
 
@@ -87,11 +105,11 @@ Rules for the JSON:
 ---
 
 **Risk Analysts Debate History:**
-{history}
+{debate_history}
 
 ---
 
-Be decisive and ground every conclusion in specific evidence from the analysts. If the horizon is 4h or 1h, prefer tactical setups that can trigger and resolve quickly.{get_language_instruction()}"""
+Be decisive and ground every conclusion in specific evidence from the analysts. If the horizon is 4h or 1h, prefer tactical setups that can trigger and resolve quickly. Keep the prose sections concise and avoid repeating the full debate transcript.{get_language_instruction()}"""
 
         response = llm.invoke(prompt)
         action = {}
@@ -109,6 +127,7 @@ Be decisive and ground every conclusion in specific evidence from the analysts. 
         new_risk_debate_state = {
             "judge_decision": response.content,
             "history": risk_debate_state["history"],
+            "summary": risk_debate_state.get("summary", ""),
             "aggressive_history": risk_debate_state["aggressive_history"],
             "conservative_history": risk_debate_state["conservative_history"],
             "neutral_history": risk_debate_state["neutral_history"],

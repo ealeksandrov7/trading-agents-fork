@@ -43,6 +43,7 @@ from cli.announcements import fetch_announcements, display_announcements
 from cli.stats_handler import StatsCallbackHandler
 
 console = Console()
+DEFAULT_INTERACTIVE_TICKER = "BTC-USD"
 
 app = typer.Typer(
     name="TradingAgents",
@@ -515,13 +516,13 @@ def get_user_selections():
         create_question_box(
             "Step 1: Ticker Symbol",
             "Enter the exact ticker symbol to analyze, including exchange suffix when needed (examples: SPY, CNC.TO, 7203.T, 0700.HK)",
-            "SPY",
+            DEFAULT_INTERACTIVE_TICKER,
         )
     )
     selected_ticker = get_ticker()
 
     # Step 2: Analysis date
-    default_date = datetime.datetime.now().strftime("%Y-%m-%d")
+    default_date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     console.print(
         create_question_box(
             "Step 2: Analysis Date",
@@ -625,14 +626,15 @@ def get_user_selections():
 
 def get_ticker():
     """Get ticker symbol from user input."""
-    return typer.prompt("", default="SPY")
+    return typer.prompt("", default=DEFAULT_INTERACTIVE_TICKER)
 
 
 def get_analysis_date():
     """Get the analysis timestamp from user input."""
+    default_timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     while True:
         date_str = typer.prompt(
-            "", default=datetime.datetime.now().strftime("%Y-%m-%d")
+            "", default=default_timestamp
         )
         try:
             analysis_date = datetime.datetime.fromisoformat(date_str.replace("T", " "))

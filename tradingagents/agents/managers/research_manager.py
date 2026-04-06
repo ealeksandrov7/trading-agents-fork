@@ -2,14 +2,17 @@ import time
 import json
 
 from tradingagents.agents.utils.agent_utils import build_instrument_context
+from tradingagents.agents.utils.prompt_utils import compact_history, compact_memories
 from tradingagents.dataflows.config import get_config
 
 
 def create_research_manager(llm, memory):
     def research_manager_node(state) -> dict:
+        config = get_config()
         instrument_context = build_instrument_context(state["company_of_interest"])
-        analysis_timeframe = get_config().get("analysis_timeframe", "1d")
+        analysis_timeframe = config.get("analysis_timeframe", "1d")
         history = state["investment_debate_state"].get("history", "")
+        summary = state["investment_debate_state"].get("summary", "")
         market_research_report = state["market_report"]
         sentiment_report = state["sentiment_report"]
         news_report = state["news_report"]
@@ -21,8 +24,21 @@ def create_research_manager(llm, memory):
         past_memories = memory.get_memories(curr_situation, n_matches=2)
 
         past_memory_str = ""
-        for i, rec in enumerate(past_memories, 1):
+        for rec in past_memories:
             past_memory_str += rec["recommendation"] + "\n\n"
+
+        if config.get("compact_reasoning", True):
+            debate_history = compact_history(
+                summary or history,
+                max_chars=config.get("compact_history_max_chars", 1200),
+            )
+            lessons = compact_memories(
+                past_memory_str,
+                max_chars=config.get("compact_memory_max_chars", 500),
+            )
+        else:
+            debate_history = history
+            lessons = past_memory_str
 
         prompt = f"""As the portfolio manager and debate facilitator, your role is to critically evaluate this round of debate and make a definitive decision: align with the bear analyst, the bull analyst, or choose Hold only if it is strongly justified based on the arguments presented.
 
@@ -35,20 +51,22 @@ Rationale: An explanation of why these arguments lead to your conclusion.
 Strategic Actions: Concrete steps for implementing the recommendation.
 Time Horizon: The configured trading horizon is {analysis_timeframe}. If this is 4h or 1h, prioritize short-term tactical setups, concrete trigger levels, and invalidation that can play out quickly.
 Take into account your past mistakes on similar situations. Use these insights to refine your decision-making and ensure you are learning and improving. Present your analysis conversationally, as if speaking naturally, without special formatting. 
+Keep the output under 260 words and do not repeat the full debate transcript.
 
 Here are your past reflections on mistakes:
-\"{past_memory_str}\"
+\"{lessons}\"
 
 {instrument_context}
 
 Here is the debate:
 Debate History:
-{history}"""
+{debate_history}"""
         response = llm.invoke(prompt)
 
         new_investment_debate_state = {
             "judge_decision": response.content,
             "history": investment_debate_state.get("history", ""),
+            "summary": investment_debate_state.get("summary", ""),
             "bear_history": investment_debate_state.get("bear_history", ""),
             "bull_history": investment_debate_state.get("bull_history", ""),
             "current_response": response.content,

@@ -1,0 +1,21 @@
+{
+  "mode": "paper",
+  "symbol": "BTC",
+  "action": "FLAT",
+  "size": 0.002813,
+  "reference_price": 69570.5,
+  "entry_mode": "MARKET",
+  "limit_price": null,
+  "limit_zone_low": null,
+  "limit_zone_high": null,
+  "leverage": 1,
+  "stop_loss": null,
+  "take_profit": null,
+  "confidence": 0.58,
+  "thesis_summary": "btc-usd looks tactically stretched on the 1h and the bearish case is stronger than the bullish one here, but without the requested breakdown trigger the best portfolio decision is to stay flat rather than pre-empt a short.",
+  "time_horizon": "1h",
+  "invalidation": "A confirmed 1h breakdown through the most recent swing low with follow-through would invalidate the sidelined stance and justify a tactical short.",
+  "decision_timestamp": "2026-04-06 14:00",
+  "rationale": "Closing the current position.",
+  "reduce_only": true
+}

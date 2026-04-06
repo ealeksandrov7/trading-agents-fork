@@ -1,0 +1,14 @@
+{
+  "status": "filled",
+  "mode": "paper",
+  "symbol": "BTC",
+  "action": "FLAT",
+  "message": "Paper position closed.",
+  "reference_price": 69570.5,
+  "size": 0.002813,
+  "leverage": 1,
+  "stop_loss": null,
+  "take_profit": null,
+  "order_id": null,
+  "raw_response": null
+}

@@ -9,6 +9,7 @@ from .stockstats_utils import (
     _clean_dataframe,
     filter_financials_by_date,
     get_analysis_timeframe,
+    get_indicator_analysis_window_days,
     get_cutoff_timestamp,
     get_timeframe_interval,
     get_timeframe_label,
@@ -16,6 +17,37 @@ from .stockstats_utils import (
     resample_ohlcv,
     yf_retry,
 )
+
+
+def _build_higher_timeframe_trend_anchor(symbol: str, curr_date: str) -> str:
+    daily_data = load_ohlcv(symbol, curr_date, timeframe_override="1d")
+    if daily_data.empty:
+        return "Higher-timeframe trend anchor unavailable."
+
+    frame = daily_data.copy().sort_values("Date")
+    frame["close_50_sma"] = frame["Close"].rolling(50).mean()
+    frame["close_200_sma"] = frame["Close"].rolling(200).mean()
+    latest = frame.iloc[-1]
+
+    close_price = latest["Close"]
+    sma_50 = latest.get("close_50_sma")
+    sma_200 = latest.get("close_200_sma")
+
+    trend_bits = []
+    if pd.notna(sma_50):
+        relation_50 = "above" if close_price >= sma_50 else "below"
+        trend_bits.append(f"daily close {close_price:.2f} is {relation_50} the 50 SMA ({sma_50:.2f})")
+    if pd.notna(sma_200):
+        relation_200 = "above" if close_price >= sma_200 else "below"
+        trend_bits.append(f"{relation_200} the 200 SMA ({sma_200:.2f})")
+    if pd.notna(sma_50) and pd.notna(sma_200):
+        slope = "bullish" if sma_50 >= sma_200 else "bearish"
+        trend_bits.append(f"50/200 daily trend structure is {slope}")
+
+    if not trend_bits:
+        return "Higher-timeframe trend anchor unavailable."
+
+    return "Higher-timeframe daily anchor: " + "; ".join(trend_bits) + "."
 
 def get_YFin_data_online(
     symbol: Annotated[str, "ticker symbol of the company"],
@@ -162,6 +194,9 @@ def get_stock_stats_indicators_window(
     curr_date_dt = pd.to_datetime(curr_date).to_pydatetime()
     before = curr_date_dt - relativedelta(days=look_back_days)
     timeframe = get_analysis_timeframe()
+    recommended_window = get_indicator_analysis_window_days(timeframe)
+    if look_back_days == 30:
+        look_back_days = recommended_window
 
     # Optimized: Get stock data once and calculate indicators for all dates
     try:
@@ -208,6 +243,9 @@ def get_stock_stats_indicators_window(
         + "\n\n"
         + best_ind_params.get(indicator, "No description available.")
     )
+
+    if timeframe in ("1h", "4h"):
+        result_str += "\n\n" + _build_higher_timeframe_trend_anchor(symbol, curr_date)
 
     return result_str
 

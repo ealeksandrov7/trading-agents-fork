@@ -15,7 +15,13 @@ from tradingagents.execution import (
     RiskEvaluationError,
     TradeAction,
 )
-from tradingagents.dataflows.stockstats_utils import _clean_dataframe, resample_ohlcv
+from tradingagents.dataflows.stockstats_utils import (
+    _clean_dataframe,
+    get_cutoff_timestamp,
+    get_indicator_analysis_window_days,
+    get_indicator_compute_window_days,
+    resample_ohlcv,
+)
 
 
 RAW_DECISION = """
@@ -240,6 +246,93 @@ class PaperBrokerTests(unittest.TestCase):
             preview = broker.execute(intent)
             self.assertEqual(preview.status.value, "preview")
             self.assertIsNone(broker.get_open_position())
+            self.assertIsNotNone(broker.get_pending_order("BTC"))
+
+    def test_paper_pending_limit_zone_fills_on_later_run(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            broker = PaperBroker(Path(tmpdir) / "ledger.json")
+            engine = RiskEngine(
+                bankroll=1000,
+                max_risk_per_trade_pct=0.01,
+                max_leverage=2,
+                allowed_symbols=("BTC", "ETH"),
+                single_position_mode=True,
+                decision_timeframe="4h",
+            )
+            decision = DecisionParser.parse(RAW_DECISION).model_copy(
+                update={
+                    "action": TradeAction.SHORT,
+                    "entry_mode": EntryMode.LIMIT_ZONE,
+                    "entry_zone_low": 69000,
+                    "entry_zone_high": 69500,
+                    "stop_loss": 70500,
+                    "take_profit": 64700,
+                }
+            )
+            staged_intent = engine.build_order_intent(
+                decision,
+                reference_price=66944.5,
+                mode=ExecutionMode.PAPER,
+            )
+            staged_preview = broker.execute(staged_intent)
+            self.assertEqual(staged_preview.status.value, "preview")
+            self.assertIsNotNone(broker.get_pending_order("BTC"))
+
+            flat_decision = decision.model_copy(
+                update={"action": TradeAction.FLAT, "stop_loss": None, "take_profit": None}
+            )
+            reconcile_intent = engine.build_order_intent(
+                flat_decision,
+                reference_price=69250,
+                mode=ExecutionMode.PAPER,
+                open_position=None,
+            )
+            reconcile_preview = broker.execute(reconcile_intent)
+            self.assertEqual(reconcile_preview.status.value, "filled")
+            self.assertIsNone(broker.get_open_position())
+            self.assertIsNone(broker.get_pending_order("BTC"))
+            ledger = json.loads((Path(tmpdir) / "ledger.json").read_text())
+            messages = [entry["result"]["message"] for entry in ledger["executions"]]
+            self.assertIn("Paper limit order filled from pending state.", messages)
+
+    def test_paper_position_auto_closes_on_take_profit(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            broker = PaperBroker(Path(tmpdir) / "ledger.json")
+            engine = RiskEngine(
+                bankroll=1000,
+                max_risk_per_trade_pct=0.01,
+                max_leverage=2,
+                allowed_symbols=("BTC", "ETH"),
+                single_position_mode=True,
+                decision_timeframe="4h",
+            )
+            decision = DecisionParser.parse(RAW_DECISION)
+            open_intent = engine.build_order_intent(
+                decision,
+                reference_price=85000,
+                mode=ExecutionMode.PAPER,
+            )
+            broker.execute(open_intent)
+            self.assertIsNotNone(broker.get_open_position())
+
+            flat_decision = decision.model_copy(
+                update={"action": TradeAction.FLAT, "stop_loss": None, "take_profit": None}
+            )
+            reconcile_intent = engine.build_order_intent(
+                flat_decision,
+                reference_price=90050,
+                mode=ExecutionMode.PAPER,
+                open_position=None,
+            )
+            preview = broker.execute(reconcile_intent)
+            self.assertEqual(preview.status.value, "skipped")
+            self.assertIsNone(broker.get_open_position())
+            ledger = json.loads((Path(tmpdir) / "ledger.json").read_text())
+            messages = [entry["result"]["message"] for entry in ledger["executions"]]
+            self.assertTrue(
+                any("take profit hit" in message for message in messages),
+                messages,
+            )
 
 
 class TimeframeResampleTests(unittest.TestCase):
@@ -298,6 +391,31 @@ class TimeframeResampleTests(unittest.TestCase):
         )
         result = resample_ohlcv(data, "1h")
         self.assertEqual(len(result), 2)
+
+    def test_clean_dataframe_strips_timezone_from_date_column(self):
+        data = pd.DataFrame(
+            {
+                "Date": ["2026-03-24T00:00:00Z", "2026-03-25T00:00:00Z"],
+                "Open": [1.0, 2.0],
+                "High": [2.0, 3.0],
+                "Low": [0.5, 1.5],
+                "Close": [1.5, 2.5],
+                "Volume": [10, 20],
+            }
+        )
+        cleaned = _clean_dataframe(data)
+        self.assertIsNone(cleaned["Date"].dt.tz)
+
+    def test_cutoff_timestamp_returns_timezone_naive_timestamp(self):
+        cutoff = get_cutoff_timestamp("2026-03-24T00:00:00Z")
+        self.assertIsNone(cutoff.tzinfo)
+
+    def test_timeframe_lookback_defaults_are_shorter_for_intraday(self):
+        self.assertEqual(get_indicator_analysis_window_days("1h"), 5)
+        self.assertEqual(get_indicator_analysis_window_days("4h"), 10)
+        self.assertEqual(get_indicator_analysis_window_days("1d"), 30)
+        self.assertEqual(get_indicator_compute_window_days("1h"), 21)
+        self.assertEqual(get_indicator_compute_window_days("4h"), 60)
 
 
 if __name__ == "__main__":

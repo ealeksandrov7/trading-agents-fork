@@ -20,6 +20,10 @@ DEFAULT_CONFIG = {
     # Internal agent debate stays in English for reasoning quality
     "output_language": "English",
     "analysis_timeframe": "1d",
+    "compact_reasoning": True,
+    "compact_report_max_chars": 1200,
+    "compact_history_max_chars": 1200,
+    "compact_memory_max_chars": 500,
     # Debate and discussion settings
     "max_debate_rounds": 1,
     "max_risk_discuss_rounds": 1,

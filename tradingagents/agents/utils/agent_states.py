@@ -16,6 +16,7 @@ class InvestDebateState(TypedDict):
         str, "Bearish Conversation history"
     ]  # Bullish Conversation history
     history: Annotated[str, "Conversation history"]  # Conversation history
+    summary: Annotated[str, "Rolling structured summary of the debate"]
     current_response: Annotated[str, "Latest response"]  # Last response
     judge_decision: Annotated[str, "Final judge decision"]  # Last response
     count: Annotated[int, "Length of the current conversation"]  # Conversation length
@@ -33,6 +34,7 @@ class RiskDebateState(TypedDict):
         str, "Neutral Agent's Conversation history"
     ]  # Conversation history
     history: Annotated[str, "Conversation history"]  # Conversation history
+    summary: Annotated[str, "Rolling structured summary of the debate"]
     latest_speaker: Annotated[str, "Analyst that spoke last"]
     current_aggressive_response: Annotated[
         str, "Latest response by the aggressive analyst"
