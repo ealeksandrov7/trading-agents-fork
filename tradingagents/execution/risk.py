@@ -44,13 +44,12 @@ class RiskEngine:
             raise RiskEvaluationError("reference price must be positive")
         if self.bankroll <= 0:
             raise RiskEvaluationError("bankroll must be positive")
+        if decision.action == TradeAction.FLAT:
+            return self._build_flat_intent(decision, reference_price, mode, open_position)
         if decision.time_horizon.strip().lower() != self.decision_timeframe.lower():
             raise RiskEvaluationError(
                 f"decision time horizon must be {self.decision_timeframe}"
             )
-
-        if decision.action == TradeAction.FLAT:
-            return self._build_flat_intent(decision, reference_price, mode, open_position)
 
         if self.single_position_mode and open_position and open_position.symbol != symbol:
             raise RiskEvaluationError(
@@ -120,7 +119,24 @@ class RiskEngine:
         open_position: Optional[Position],
     ) -> OrderIntent:
         if not open_position:
-            raise RiskEvaluationError("received FLAT but there is no open position to close")
+            return OrderIntent(
+                mode=mode,
+                symbol=decision.symbol,
+                action=TradeAction.FLAT,
+                size=0.0,
+                reference_price=reference_price,
+                entry_mode=EntryMode.MARKET,
+                leverage=1,
+                stop_loss=None,
+                take_profit=None,
+                confidence=decision.confidence,
+                thesis_summary=decision.thesis_summary,
+                time_horizon=decision.time_horizon,
+                invalidation=decision.invalidation,
+                decision_timestamp=decision.timestamp,
+                rationale="No open position; stay flat.",
+                reduce_only=True,
+            )
         if open_position.symbol != decision.symbol:
             raise RiskEvaluationError(
                 f"received FLAT for {decision.symbol} but open position is {open_position.symbol}"

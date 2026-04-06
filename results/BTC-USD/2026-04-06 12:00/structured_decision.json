@@ -1,0 +1,16 @@
+{
+  "symbol": "BTC",
+  "timestamp": "2026-04-06 12:00",
+  "action": "FLAT",
+  "entry_mode": "MARKET",
+  "entry_price": null,
+  "entry_zone_low": null,
+  "entry_zone_high": null,
+  "confidence": 0.4,
+  "thesis_summary": "Based on the synthesis of the available analysis\u2014specifically the caution inherent in recognizing the divergence between aggressive bullish momentum (Aggressive Momentum Bull) and necessary risk management (Prudent Risk Management)\u2014the optimal structure is to **wait for a confirmed pattern of exhaustion before taking a directional position.",
+  "time_horizon": "1d",
+  "stop_loss": null,
+  "take_profit": null,
+  "invalidation": "No explicit invalidation provided in the prose output.",
+  "size_hint": "large"
+}

@@ -78,17 +78,25 @@ class TradingAgentsGraph:
         if self.callbacks:
             llm_kwargs["callbacks"] = self.callbacks
 
+        deep_llm_kwargs = dict(llm_kwargs)
+        quick_llm_kwargs = dict(llm_kwargs)
+        if self.config.get("llm_provider", "").lower() == "ollama":
+            deep_llm_kwargs["gemma_thinking"] = self._should_enable_gemma_thinking(
+                self.config.get("deep_think_llm", "")
+            )
+            quick_llm_kwargs["gemma_thinking"] = False
+
         deep_client = create_llm_client(
             provider=self.config["llm_provider"],
             model=self.config["deep_think_llm"],
             base_url=self.config.get("backend_url"),
-            **llm_kwargs,
+            **deep_llm_kwargs,
         )
         quick_client = create_llm_client(
             provider=self.config["llm_provider"],
             model=self.config["quick_think_llm"],
             base_url=self.config.get("backend_url"),
-            **llm_kwargs,
+            **quick_llm_kwargs,
         )
 
         self.deep_thinking_llm = deep_client.get_llm()
@@ -190,6 +198,9 @@ class TradingAgentsGraph:
                 ]
             ),
         }
+
+    def _should_enable_gemma_thinking(self, model: str) -> bool:
+        return model.lower().startswith("gemma4:")
 
     def propagate(self, company_name, trade_date):
         """Run the trading agents graph for a company on a specific date."""
@@ -295,4 +306,5 @@ class TradingAgentsGraph:
             full_signal,
             symbol=symbol or self.ticker,
             trade_date=trade_date,
+            time_horizon=self.config.get("analysis_timeframe"),
         )

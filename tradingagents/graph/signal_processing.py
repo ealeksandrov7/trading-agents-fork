@@ -17,12 +17,14 @@ class SignalProcessor:
         *,
         symbol: Optional[str] = None,
         trade_date: Optional[str] = None,
+        time_horizon: Optional[str] = None,
     ) -> dict:
         try:
             return DecisionParser.parse(
                 full_signal,
                 fallback_symbol=symbol,
                 fallback_timestamp=trade_date,
+                fallback_time_horizon=time_horizon,
             ).model_dump()
         except DecisionParseError:
             return {}

@@ -1,6 +1,21 @@
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 import warnings
+import re
+
+
+_GEMMA_THOUGHT_PATTERNS = (
+    re.compile(r"<\|channel\|>thought\s*.*?(?:<\|channel\|>|<channel\|>)", re.DOTALL),
+    re.compile(r"<\|channel\|>thought\s*(?:<\|channel\|>|<channel\|>)", re.DOTALL),
+)
+
+
+def strip_gemma_thinking(text: str) -> str:
+    """Remove Gemma/Ollama thinking channel wrappers from text output."""
+    cleaned = text
+    for pattern in _GEMMA_THOUGHT_PATTERNS:
+        cleaned = pattern.sub("", cleaned)
+    return cleaned.strip()
 
 
 def normalize_content(response):
@@ -18,7 +33,9 @@ def normalize_content(response):
             else item if isinstance(item, str) else ""
             for item in content
         ]
-        response.content = "\n".join(t for t in texts if t)
+        response.content = strip_gemma_thinking("\n".join(t for t in texts if t))
+    elif isinstance(content, str):
+        response.content = strip_gemma_thinking(content)
     return response
 
 

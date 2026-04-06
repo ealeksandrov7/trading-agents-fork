@@ -1,7 +1,10 @@
 import os
+from copy import deepcopy
 from typing import Any, Optional
 
 from langchain_openai import ChatOpenAI
+from langchain_core.messages import SystemMessage
+from pydantic import PrivateAttr
 
 from .base_client import BaseLLMClient, normalize_content
 from .validators import validate_model
@@ -15,7 +18,17 @@ class NormalizedChatOpenAI(ChatOpenAI):
     downstream handling.
     """
 
+    _gemma_thinking: bool = PrivateAttr(default=False)
+    _provider_name: str = PrivateAttr(default="openai")
+
+    def __init__(self, *args, gemma_thinking: bool = False, provider_name: str = "openai", **kwargs):
+        super().__init__(*args, **kwargs)
+        self._gemma_thinking = gemma_thinking
+        self._provider_name = provider_name
+
     def invoke(self, input, config=None, **kwargs):
+        if self._gemma_thinking:
+            input = maybe_enable_gemma_thinking(input)
         return normalize_content(super().invoke(input, config, **kwargs))
 
 # Kwargs forwarded from user config to ChatOpenAI
@@ -79,8 +92,54 @@ class OpenAIClient(BaseLLMClient):
         if self.provider == "openai":
             llm_kwargs["use_responses_api"] = True
 
-        return NormalizedChatOpenAI(**llm_kwargs)
+        return NormalizedChatOpenAI(
+            gemma_thinking=self.kwargs.get("gemma_thinking", False),
+            provider_name=self.provider,
+            **llm_kwargs,
+        )
 
     def validate_model(self) -> bool:
         """Validate model for the provider."""
         return validate_model(self.provider, self.model)
+
+
+def is_gemma_ollama_model(provider: str, model: str) -> bool:
+    return provider.lower() == "ollama" and model.lower().startswith("gemma4:")
+
+
+def maybe_enable_gemma_thinking(input_data):
+    """Prefix the first system prompt with the Gemma think token."""
+    if not isinstance(input_data, list):
+        return input_data
+
+    updated = list(input_data)
+    for idx, message in enumerate(updated):
+        content = None
+        if isinstance(message, tuple) and len(message) >= 2 and message[0] == "system":
+            content = str(message[1])
+            if not content.lstrip().startswith("<|think|>"):
+                updated[idx] = ("system", f"<|think|>\n{content}")
+            return updated
+
+        if isinstance(message, dict) and message.get("role") == "system":
+            content = str(message.get("content", ""))
+            if not content.lstrip().startswith("<|think|>"):
+                new_message = deepcopy(message)
+                new_message["content"] = f"<|think|>\n{content}"
+                updated[idx] = new_message
+            return updated
+
+        role = getattr(message, "type", None)
+        if role == "system":
+            content = str(getattr(message, "content", ""))
+            if not content.lstrip().startswith("<|think|>"):
+                if hasattr(message, "model_copy"):
+                    updated[idx] = message.model_copy(
+                        update={"content": f"<|think|>\n{content}"}
+                    )
+                elif hasattr(message, "copy"):
+                    updated[idx] = message.copy(update={"content": f"<|think|>\n{content}"})
+                else:
+                    updated[idx] = SystemMessage(content=f"<|think|>\n{content}")
+            return updated
+    return updated

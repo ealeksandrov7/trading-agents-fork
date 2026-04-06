@@ -33,6 +33,8 @@ def create_portfolio_manager(llm, memory):
 
         prompt = f"""As the Portfolio Manager, synthesize the risk analysts' debate and deliver the final trading decision.
 
+Your highest priority is format compliance. You must output the `STRUCTURED_DECISION` JSON block first. If you are uncertain, still emit the JSON with your best estimate. Do not skip the JSON block.
+
 {instrument_context}
 
 ---
@@ -75,10 +77,12 @@ def create_portfolio_manager(llm, memory):
 
 Rules for the JSON:
 - Output valid JSON only inside the fenced block.
+- Output the JSON block before any prose.
 - Confidence must be between 0 and 1.
 - For `FLAT`, set both `stop_loss` and `take_profit` to null.
 - For `LONG` and `SHORT`, both `stop_loss` and `take_profit` are mandatory numeric prices.
 - {entry_rules}
+- If the correct stance is defensive or capital-preservation only, use `FLAT` instead of prose like "stay in cash" or "maintain liquidity."
 
 ---
 
@@ -97,6 +101,7 @@ Be decisive and ground every conclusion in specific evidence from the analysts. 
                 response.content,
                 fallback_symbol=state["company_of_interest"],
                 fallback_timestamp=state["trade_date"],
+                fallback_time_horizon=analysis_timeframe,
             ).model_dump()
         except DecisionParseError as exc:
             action_error = str(exc)

@@ -133,6 +133,33 @@ export ALPHA_VANTAGE_API_KEY=...   # Alpha Vantage
 
 For local models, configure Ollama with `llm_provider: "ollama"` in your config.
 
+### Ollama + Gemma 4 Local Setup
+
+For near-zero marginal cost local runs, you can use Gemma 4 through Ollama.
+
+Install Ollama and pull the Gemma models:
+
+```bash
+brew install --cask ollama
+ollama serve
+ollama pull gemma4:e4b
+ollama pull gemma4:e2b
+```
+
+Recommended local pairing for TradingAgents:
+
+```python
+config["llm_provider"] = "ollama"
+config["quick_think_llm"] = "gemma4:e2b"
+config["deep_think_llm"] = "gemma4:e4b"
+```
+
+Notes:
+- `gemma4:e4b` is the recommended deep-thinking local model.
+- `gemma4:e2b` is the fallback if `e4b` is too slow or unstable on your machine.
+- On smaller-memory Macs, prefer `e2b` first for quick validation.
+- TradingAgents enables Gemma thinking mode automatically for the deep Gemma model path and strips the thought channel from downstream outputs before parsing decisions.
+
 Alternatively, copy `.env.example` to `.env` and fill in your keys:
 ```bash
 cp .env.example .env

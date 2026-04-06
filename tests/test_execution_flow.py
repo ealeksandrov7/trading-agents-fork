@@ -38,6 +38,47 @@ EXECUTIVE_SUMMARY
 Take the trade.
 """
 
+PROSE_ONLY_FLAT = """
+As an AI model, I must synthesize the conflicting advice provided by the various expert perspectives while respecting the immediate operational constraint: adopt a defensive posture and prioritize capital preservation.
+
+Actionable Recommendation:
+Maintain high liquidity, avoid speculative bets, and prioritize capital retention over aggressive growth.
+"""
+
+OBSERVE_HOLD_FLAT = """
+Investment Strategy Report: Bitcoin (BTC/USD)
+
+Recommendation: Observe/Hold (Await Confirmation Signal)
+
+Our core strategy is therefore to adopt a defensive, observation-based stance. We recommend maintaining current exposure or exiting short-term speculative positions to wait for a clear breakout or breakdown signal.
+
+Actionable Takeaway: Avoid aggressive directional bets until market participants confirm agreement on the next macro move.
+
+Based on the synthesis of technical stagnation, elevated uncertainty, and the need for confirmation, our primary recommendation is Observation (Wait and Watch).
+"""
+
+MALFORMED_JSON_DECISION = """
+STRUCTURED_DECISION
+```json
+{
+  'symbol': 'BTC-USD',
+  'timestamp': '2026-04-02 11:00',
+  'action': 'SHORT',
+  'entry_mode': 'LIMIT_ZONE',
+  'entry_price': null,
+  'entry_zone_low': 67500,
+  'entry_zone_high': 68000,
+  'confidence': 0.52,
+  'thesis_summary': 'Fade the bounce.',
+  'time_horizon': '1h',
+  'stop_loss': 68500,
+  'take_profit': 64000,
+  'invalidation': 'Hourly close above 68500.',
+  'size_hint': 'small',
+}
+```
+"""
+
 
 class DecisionParserTests(unittest.TestCase):
     def test_parse_structured_decision(self):
@@ -50,6 +91,37 @@ class DecisionParserTests(unittest.TestCase):
     def test_parse_rejects_missing_json(self):
         with self.assertRaises(DecisionParseError):
             DecisionParser.parse("No JSON here")
+
+    def test_parse_recovers_from_prose_only_flat(self):
+        decision = DecisionParser.parse(
+            PROSE_ONLY_FLAT,
+            fallback_symbol="BTC-USD",
+            fallback_timestamp="2026-04-06 11:00",
+            fallback_time_horizon="4h",
+        )
+        self.assertEqual(decision.symbol, "BTC")
+        self.assertEqual(decision.action, TradeAction.FLAT)
+        self.assertEqual(decision.entry_mode, EntryMode.MARKET)
+        self.assertIsNone(decision.stop_loss)
+        self.assertIsNone(decision.take_profit)
+        self.assertEqual(decision.time_horizon, "4h")
+
+    def test_parse_recovers_from_malformed_json(self):
+        decision = DecisionParser.parse(MALFORMED_JSON_DECISION)
+        self.assertEqual(decision.symbol, "BTC")
+        self.assertEqual(decision.action, TradeAction.SHORT)
+        self.assertEqual(decision.entry_mode, EntryMode.LIMIT_ZONE)
+
+    def test_parse_recovers_from_observe_hold_language(self):
+        decision = DecisionParser.parse(
+            OBSERVE_HOLD_FLAT,
+            fallback_symbol="BTC-USD",
+            fallback_timestamp="2026-04-06 11:00",
+            fallback_time_horizon="1h",
+        )
+        self.assertEqual(decision.action, TradeAction.FLAT)
+        self.assertEqual(decision.entry_mode, EntryMode.MARKET)
+        self.assertEqual(decision.time_horizon, "1h")
 
 
 class RiskEngineTests(unittest.TestCase):
@@ -82,6 +154,22 @@ class RiskEngineTests(unittest.TestCase):
                 reference_price=85000,
                 mode=ExecutionMode.PAPER,
             )
+
+    def test_flat_ignores_time_horizon_mismatch_when_no_position_exists(self):
+        decision = DecisionParser.parse(
+            OBSERVE_HOLD_FLAT,
+            fallback_symbol="BTC-USD",
+            fallback_timestamp="2026-04-06 11:00",
+            fallback_time_horizon="1h",
+        )
+        intent = self.engine.build_order_intent(
+            decision,
+            reference_price=85000,
+            mode=ExecutionMode.PAPER,
+            open_position=None,
+        )
+        self.assertEqual(intent.action, TradeAction.FLAT)
+        self.assertEqual(intent.size, 0.0)
 
 
 class PaperBrokerTests(unittest.TestCase):

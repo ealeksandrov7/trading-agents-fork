@@ -75,11 +75,14 @@ MODEL_OPTIONS: ProviderModeOptions = {
     },
     "ollama": {
         "quick": [
+            ("Gemma 4 E2B (local, Gemma fallback)", "gemma4:e2b"),
             ("Qwen3:latest (8B, local)", "qwen3:latest"),
             ("GPT-OSS:latest (20B, local)", "gpt-oss:latest"),
             ("GLM-4.7-Flash:latest (30B, local)", "glm-4.7-flash:latest"),
         ],
         "deep": [
+            ("Gemma 4 E4B (local, recommended)", "gemma4:e4b"),
+            ("Gemma 4 E2B (local, smaller fallback)", "gemma4:e2b"),
             ("GLM-4.7-Flash:latest (30B, local)", "glm-4.7-flash:latest"),
             ("GPT-OSS:latest (20B, local)", "gpt-oss:latest"),
             ("Qwen3:latest (8B, local)", "qwen3:latest"),
