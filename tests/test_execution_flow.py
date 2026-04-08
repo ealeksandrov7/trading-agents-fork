@@ -10,6 +10,8 @@ from tradingagents.execution import (
     DecisionParser,
     EntryMode,
     ExecutionMode,
+    HyperliquidExecutor,
+    OrderIntent,
     PaperBroker,
     RiskEngine,
     RiskEvaluationError,
@@ -136,6 +138,7 @@ class RiskEngineTests(unittest.TestCase):
             bankroll=1000,
             max_risk_per_trade_pct=0.01,
             max_leverage=2,
+            min_notional_usd=10.0,
             allowed_symbols=("BTC", "ETH"),
             single_position_mode=True,
             decision_timeframe="4h",
@@ -152,12 +155,57 @@ class RiskEngineTests(unittest.TestCase):
         self.assertEqual(intent.action, TradeAction.LONG)
         self.assertGreater(intent.size, 0)
 
+    def test_floors_to_min_notional_instead_of_rejecting(self):
+        engine = RiskEngine(
+            bankroll=1000,
+            max_risk_per_trade_pct=0.00001,
+            max_leverage=2,
+            min_notional_usd=10.0,
+            allowed_symbols=("BTC", "ETH"),
+            single_position_mode=True,
+            decision_timeframe="4h",
+        )
+        intent = engine.build_order_intent(
+            self.decision,
+            reference_price=85000,
+            mode=ExecutionMode.PAPER,
+        )
+        self.assertGreaterEqual(intent.size * 85000, 10.0)
+        self.assertLess(intent.size * 85000, 10.1)
+        self.assertIn("minimum notional", intent.rationale)
+
     def test_rejects_wrong_time_horizon(self):
         decision = self.decision.model_copy(update={"time_horizon": "1h"})
         with self.assertRaises(RiskEvaluationError):
             self.engine.build_order_intent(
                 decision,
                 reference_price=85000,
+                mode=ExecutionMode.PAPER,
+            )
+
+    def test_rejects_entry_too_far_from_market_for_timeframe(self):
+        engine = RiskEngine(
+            bankroll=1000,
+            max_risk_per_trade_pct=0.01,
+            max_leverage=2,
+            min_notional_usd=10.0,
+            allowed_symbols=("BTC", "ETH"),
+            single_position_mode=True,
+            decision_timeframe="1h",
+            max_entry_distance_pct=0.05,
+        )
+        decision = DecisionParser.parse(MALFORMED_JSON_DECISION).model_copy(
+            update={
+                "entry_zone_low": 79200.0,
+                "entry_zone_high": 79650.0,
+                "stop_loss": 80150.0,
+                "take_profit": 78100.0,
+            }
+        )
+        with self.assertRaises(RiskEvaluationError):
+            engine.build_order_intent(
+                decision,
+                reference_price=71890.0,
                 mode=ExecutionMode.PAPER,
             )
 
@@ -186,6 +234,7 @@ class PaperBrokerTests(unittest.TestCase):
                 bankroll=1000,
                 max_risk_per_trade_pct=0.01,
                 max_leverage=2,
+                min_notional_usd=10.0,
                 allowed_symbols=("BTC", "ETH"),
                 single_position_mode=True,
                 decision_timeframe="4h",
@@ -224,6 +273,7 @@ class PaperBrokerTests(unittest.TestCase):
                 bankroll=1000,
                 max_risk_per_trade_pct=0.01,
                 max_leverage=2,
+                min_notional_usd=10.0,
                 allowed_symbols=("BTC", "ETH"),
                 single_position_mode=True,
                 decision_timeframe="4h",
@@ -333,6 +383,139 @@ class PaperBrokerTests(unittest.TestCase):
                 any("take profit hit" in message for message in messages),
                 messages,
             )
+
+
+class HyperliquidExecutorTests(unittest.TestCase):
+    def _build_executor(self, exchange):
+        executor = HyperliquidExecutor.__new__(HyperliquidExecutor)
+        executor.exchange = exchange
+        executor.info = None
+        executor.wallet_address = "0xabc"
+        executor.private_key = "key"
+        executor.testnet = True
+        executor.base_url = "https://api.hyperliquid-testnet.xyz"
+        return executor
+
+    def test_live_limit_entry_uses_native_tpsl_grouping(self):
+        class StubExchange:
+            def __init__(self):
+                self.updated_leverage = None
+                self.bulk_request = None
+                self.bulk_grouping = None
+
+            def update_leverage(self, leverage, symbol, is_cross=True):
+                self.updated_leverage = (leverage, symbol, is_cross)
+
+            def bulk_orders(self, order_requests, grouping="na"):
+                self.bulk_request = order_requests
+                self.bulk_grouping = grouping
+                return {
+                    "response": {
+                        "data": {
+                            "statuses": [
+                                {"resting": {"oid": 101}},
+                                {"resting": {"oid": 102}},
+                                {"resting": {"oid": 103}},
+                            ]
+                        }
+                    }
+                }
+
+        exchange = StubExchange()
+        executor = self._build_executor(exchange)
+        intent = OrderIntent(
+            mode=ExecutionMode.LIVE,
+            symbol="BTC",
+            action=TradeAction.SHORT,
+            size=0.01,
+            reference_price=68300,
+            entry_mode=EntryMode.LIMIT_ZONE,
+            limit_zone_low=69200,
+            limit_zone_high=69400,
+            leverage=1,
+            stop_loss=70100,
+            take_profit=67000,
+            confidence=0.61,
+            thesis_summary="Short the bounce.",
+            time_horizon="1h",
+            invalidation="Hourly close above resistance.",
+            decision_timestamp="2026-04-07 16:00",
+            rationale="test",
+        )
+
+        preview = executor.execute(intent)
+
+        self.assertEqual(exchange.updated_leverage, (1, "BTC", True))
+        self.assertEqual(exchange.bulk_grouping, "normalTpsl")
+        self.assertEqual(len(exchange.bulk_request), 3)
+        parent, tp, sl = exchange.bulk_request
+        self.assertEqual(parent["coin"], "BTC")
+        self.assertFalse(parent["is_buy"])
+        self.assertEqual(parent["order_type"], {"limit": {"tif": "Gtc"}})
+        self.assertFalse(parent["reduce_only"])
+        self.assertTrue(tp["is_buy"])
+        self.assertTrue(tp["reduce_only"])
+        self.assertEqual(tp["order_type"]["trigger"]["tpsl"], "tp")
+        self.assertEqual(sl["order_type"]["trigger"]["tpsl"], "sl")
+        self.assertEqual(preview.order_id, "101")
+        self.assertEqual(preview.message, "Submitted live entry with native TP/SL bracket.")
+
+    def test_live_market_entry_uses_ioc_parent_for_native_tpsl_grouping(self):
+        class StubExchange:
+            def __init__(self):
+                self.bulk_request = None
+
+            def update_leverage(self, leverage, symbol, is_cross=True):
+                pass
+
+            def _slippage_price(self, name, is_buy, slippage, px=None):
+                return 68100.0
+
+            def bulk_orders(self, order_requests, grouping="na"):
+                self.bulk_request = order_requests
+                return {"response": {"data": {"statuses": [{"filled": {"oid": 201}}]}}}
+
+        exchange = StubExchange()
+        executor = self._build_executor(exchange)
+        intent = OrderIntent(
+            mode=ExecutionMode.LIVE,
+            symbol="BTC",
+            action=TradeAction.LONG,
+            size=0.01,
+            reference_price=68000,
+            entry_mode=EntryMode.MARKET,
+            leverage=2,
+            stop_loss=67000,
+            take_profit=70000,
+            confidence=0.7,
+            thesis_summary="Breakout long.",
+            time_horizon="1h",
+            invalidation="Lose breakout level.",
+            decision_timestamp="2026-04-07 16:00",
+            rationale="test",
+        )
+
+        preview = executor.execute(intent)
+
+        parent = exchange.bulk_request[0]
+        self.assertEqual(parent["order_type"], {"limit": {"tif": "Ioc"}})
+        self.assertEqual(parent["limit_px"], 68100.0)
+        self.assertEqual(preview.order_id, "201")
+
+    def test_extract_order_ids_ignores_non_dict_status_entries(self):
+        executor = self._build_executor(exchange=None)
+        raw = {
+            "response": {
+                "data": {
+                    "statuses": [
+                        "ok",
+                        {"resting": {"oid": 301}},
+                        {"filled": {"oid": 302}},
+                    ]
+                }
+            }
+        }
+        self.assertEqual(executor._extract_order_ids(raw), ["301", "302"])
 
 
 class TimeframeResampleTests(unittest.TestCase):

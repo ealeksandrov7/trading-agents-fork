@@ -161,6 +161,8 @@ class DecisionParser:
             ),
             "invalidation": cls._infer_invalidation(raw_text),
             "size_hint": cls._infer_size_hint(raw_text),
+            "setup_expiry_bars": cls._infer_setup_expiry_bars(raw_text),
+            "position_instruction": cls._infer_position_instruction(raw_text, action),
         }
 
         if action == "FLAT":
@@ -258,6 +260,30 @@ class DecisionParser:
             if len(line.split()) >= 6:
                 return line[:400]
         return "Recovered from prose-only portfolio manager output."
+
+    @staticmethod
+    def _infer_setup_expiry_bars(raw_text: str) -> Optional[int]:
+        match = re.search(r'"setup_expiry_bars"\s*:\s*(\d+)', raw_text)
+        if match:
+            return int(match.group(1))
+        match = re.search(r"\bexpire(?:s|d)?\s+after\s+(\d+)\s+bars?\b", raw_text, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+        return None
+
+    @staticmethod
+    def _infer_position_instruction(raw_text: str, action: str) -> str:
+        match = re.search(r'"position_instruction"\s*:\s*"([A-Z_]+)"', raw_text)
+        if match:
+            return match.group(1)
+        if action == "FLAT":
+            lower = raw_text.lower()
+            if "cancel" in lower and "order" in lower:
+                return "CANCEL_ENTRY"
+            if "close" in lower or "exit" in lower:
+                return "CLOSE"
+            return "NO_ACTION"
+        return "OPEN"
 
     @staticmethod
     def _infer_time_horizon(raw_text: str, fallback_time_horizon: Optional[str] = None) -> str:

@@ -1,0 +1,21 @@
+{
+  "mode": "paper",
+  "symbol": "BTC",
+  "action": "SHORT",
+  "size": 0.025,
+  "reference_price": 68820.5,
+  "entry_mode": "LIMIT_ZONE",
+  "limit_price": null,
+  "limit_zone_low": 68700.0,
+  "limit_zone_high": 68900.0,
+  "leverage": 2,
+  "stop_loss": 69200.0,
+  "take_profit": 67800.0,
+  "confidence": 0.58,
+  "thesis_summary": "On the 1h, BTC-USD lacks clean bullish confirmation and is vulnerable to a failed retest below 68,900, favoring a small tactical short.",
+  "time_horizon": "1h",
+  "invalidation": "A 1h close above 69,200 or a decisive breakout that holds above the 68,900 retest zone would invalidate the bearish setup.",
+  "decision_timestamp": "2026-04-07 09:34",
+  "rationale": "Accepted by deterministic risk engine.",
+  "reduce_only": false
+}

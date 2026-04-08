@@ -1,5 +1,7 @@
 from .models import (
     EntryMode,
+    ExchangeOrder,
+    ExchangeStateSnapshot,
     ExecutionMode,
     OrderIntent,
     OrderPreview,
@@ -17,6 +19,8 @@ __all__ = [
     "DecisionParseError",
     "DecisionParser",
     "EntryMode",
+    "ExchangeOrder",
+    "ExchangeStateSnapshot",
     "ExecutionMode",
     "HyperliquidExecutionError",
     "HyperliquidExecutor",

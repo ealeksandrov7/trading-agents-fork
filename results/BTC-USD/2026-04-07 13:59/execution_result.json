@@ -1,0 +1,14 @@
+{
+  "status": "preview",
+  "mode": "analysis",
+  "symbol": "BTC",
+  "action": "FLAT",
+  "message": "Ready for execution.",
+  "reference_price": 68353.5,
+  "size": 0.0,
+  "leverage": 1,
+  "stop_loss": null,
+  "take_profit": null,
+  "order_id": null,
+  "raw_response": null
+}

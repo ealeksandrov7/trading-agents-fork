@@ -14,6 +14,8 @@ def create_trader(llm, memory):
         config = get_config()
         analysis_timeframe = config.get("analysis_timeframe", "1d")
         investment_plan = state["investment_plan"]
+        exchange_state_summary = state.get("exchange_state_summary", "")
+        bot_state_summary = state.get("bot_state_summary", "")
         market_research_report = state["market_report"]
         sentiment_report = state["sentiment_report"]
         news_report = state["news_report"]
@@ -41,7 +43,7 @@ def create_trader(llm, memory):
 
         context = {
             "role": "user",
-            "content": f"Based on a comprehensive analysis by a team of analysts, here is an investment plan tailored for {company_name}. {instrument_context} This plan incorporates insights from current technical market trends, macroeconomic indicators, and social media sentiment. Use this plan as a foundation for evaluating your next trading decision.\n\nProposed Investment Plan: {compact_plan}\n\nLeverage these insights to make an informed and strategic decision.",
+            "content": f"Based on a comprehensive analysis by a team of analysts, here is an investment plan tailored for {company_name}. {instrument_context} This plan incorporates insights from current technical market trends, macroeconomic indicators, and social media sentiment. Use this plan as a foundation for evaluating your next trading decision.\n\nProposed Investment Plan: {compact_plan}\n\nCurrent exchange/account context:\n{exchange_state_summary or 'No exchange state provided.'}\n\nCurrent bot state:\n{bot_state_summary or 'No bot state provided.'}\n\nLeverage these insights to make an informed and strategic decision.",
         }
 
         messages = [

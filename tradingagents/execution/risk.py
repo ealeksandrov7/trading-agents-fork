@@ -23,9 +23,11 @@ class RiskEngine:
     bankroll: float
     max_risk_per_trade_pct: float
     max_leverage: int
+    min_notional_usd: float = 0.0
     allowed_symbols: tuple[str, ...] = ("BTC", "ETH")
     single_position_mode: bool = True
     decision_timeframe: str = "4h"
+    max_entry_distance_pct: Optional[float] = None
 
     def build_order_intent(
         self,
@@ -63,6 +65,7 @@ class RiskEngine:
 
         is_long = decision.action == TradeAction.LONG
         entry_reference_price = self._resolve_entry_reference_price(decision, reference_price)
+        self._validate_entry_distance(entry_reference_price, reference_price)
 
         if is_long:
             if stop_loss >= entry_reference_price:
@@ -82,6 +85,15 @@ class RiskEngine:
 
         risk_budget = self.bankroll * self.max_risk_per_trade_pct
         size = risk_budget / stop_distance
+        min_size = 0.0
+        size_floor_reason = ""
+        if self.min_notional_usd > 0:
+            min_size = self.min_notional_usd / entry_reference_price
+            if size < min_size:
+                size = min_size
+                size_floor_reason = (
+                    f" Size was floored to the minimum notional ${self.min_notional_usd:.2f}."
+                )
         notional = size * entry_reference_price
         implied_leverage = max(1, int(-(-notional // self.bankroll)))
         if implied_leverage > self.max_leverage:
@@ -107,9 +119,22 @@ class RiskEngine:
             time_horizon=decision.time_horizon,
             invalidation=decision.invalidation,
             decision_timestamp=decision.timestamp,
-            rationale="Accepted by deterministic risk engine.",
+            rationale=(
+                "Accepted by deterministic risk engine."
+                f"{size_floor_reason}"
+            ),
             reduce_only=False,
         )
+
+    def _validate_entry_distance(self, entry_price: float, market_price: float) -> None:
+        if self.max_entry_distance_pct is None or self.max_entry_distance_pct <= 0:
+            return
+        distance_pct = abs(entry_price - market_price) / market_price
+        if distance_pct > self.max_entry_distance_pct:
+            raise RiskEvaluationError(
+                "entry is too far from current market price "
+                f"({distance_pct:.1%} > {self.max_entry_distance_pct:.1%})"
+            )
 
     def _build_flat_intent(
         self,

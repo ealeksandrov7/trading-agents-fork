@@ -26,6 +26,7 @@ from rich.rule import Rule
 
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.bot import BotConfig, BotRunner
 from tradingagents.execution import (
     ExecutionMode,
     HyperliquidExecutionError,
@@ -1348,6 +1349,7 @@ def execute_trade_flow(analysis_result: dict) -> None:
         bankroll=bankroll,
         max_risk_per_trade_pct=config["max_risk_per_trade_pct"],
         max_leverage=config["max_leverage"],
+        min_notional_usd=config["min_notional_usd"],
         allowed_symbols=tuple(config["allowed_symbols"]),
         single_position_mode=config["single_position_mode"],
         decision_timeframe=config["decision_timeframe"],
@@ -1473,6 +1475,39 @@ def trade(
 
 def main():
     app(prog_name="tradingagents")
+
+
+@app.command()
+def bot(
+    symbol: str = typer.Option("BTC-USD", "--symbol", help="Instrument to trade."),
+    timeframe: str = typer.Option("1h", "--timeframe", help="Decision timeframe."),
+    analysis_interval_minutes: int = typer.Option(240, "--analysis-interval-minutes", help="How often to rerun the full analysis graph."),
+    once: bool = typer.Option(False, "--once", help="Run exactly one bot cycle and exit."),
+    testnet: bool = typer.Option(True, "--testnet/--mainnet", help="Use Hyperliquid testnet."),
+):
+    config = DEFAULT_CONFIG.copy()
+    config["analysis_timeframe"] = timeframe
+    config["decision_timeframe"] = timeframe
+    config["hyperliquid_testnet"] = testnet
+    config["bot_analysis_interval_minutes"] = analysis_interval_minutes
+    bot_runner = BotRunner(
+        config=config,
+        bot_config=BotConfig(
+            symbol=symbol,
+            timeframe=timeframe,
+            testnet=testnet,
+            once=once,
+            analysis_interval_minutes=config["bot_analysis_interval_minutes"],
+            reconcile_interval_seconds=config["bot_reconcile_interval_seconds"],
+            setup_expiry_bars_default=config["bot_setup_expiry_bars_default"],
+        ),
+        event_sink=console.print,
+    )
+    if once:
+        bot_runner.run_once()
+        console.print("[green]Completed one autonomous bot cycle.[/green]")
+        return
+    bot_runner.run_forever()
 
 
 if __name__ == "__main__":

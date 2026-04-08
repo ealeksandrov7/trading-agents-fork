@@ -1,0 +1,16 @@
+{
+  "symbol": "BTC",
+  "timestamp": "2026-04-06 16:46",
+  "action": "FLAT",
+  "entry_mode": "MARKET",
+  "entry_price": null,
+  "entry_zone_low": null,
+  "entry_zone_high": null,
+  "confidence": 0.64,
+  "thesis_summary": "The bear case is tactically stronger on a 1h basis, but without a confirmed breakdown or failed retest the neutral analyst's caution argues against forcing immediate exposure.",
+  "time_horizon": "1h",
+  "stop_loss": null,
+  "take_profit": null,
+  "invalidation": "Staying flat is invalidated by a clean 1h break below the latest swing low followed by a failed retest that confirms short continuation; conversely, a sustained reclaim above the prior 1h range high would negate the bearish setup.",
+  "size_hint": "small"
+}

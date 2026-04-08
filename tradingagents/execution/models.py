@@ -48,6 +48,8 @@ class StructuredTradeDecision(BaseModel):
     take_profit: Optional[float] = Field(default=None, gt=0.0)
     invalidation: str
     size_hint: Optional[str] = None
+    setup_expiry_bars: Optional[int] = Field(default=None, ge=1)
+    position_instruction: Optional[str] = None
 
     @field_validator("symbol")
     @classmethod
@@ -160,3 +162,29 @@ class OrderPreview(BaseModel):
     take_profit: Optional[float] = None
     order_id: Optional[str] = None
     raw_response: Optional[dict] = None
+
+
+class ExchangeOrder(BaseModel):
+    symbol: str
+    order_id: str
+    side: TradeAction
+    size: float = Field(ge=0.0)
+    limit_price: Optional[float] = Field(default=None, gt=0.0)
+    reduce_only: bool = False
+    status: str = "open"
+
+    @field_validator("symbol")
+    @classmethod
+    def normalize_exchange_order_symbol(cls, value: str) -> str:
+        return canonical_symbol(value)
+
+
+class ExchangeStateSnapshot(BaseModel):
+    wallet_address: Optional[str] = None
+    equity: Optional[float] = None
+    available_balance: Optional[float] = None
+    spot_usdc_balance: Optional[float] = None
+    mark_prices: dict[str, float] = Field(default_factory=dict)
+    positions: list[Position] = Field(default_factory=list)
+    open_orders: list[ExchangeOrder] = Field(default_factory=list)
+    fetched_at: str

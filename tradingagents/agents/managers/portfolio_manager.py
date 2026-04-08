@@ -19,6 +19,8 @@ def create_portfolio_manager(llm, memory):
         fundamentals_report = state["fundamentals_report"]
         sentiment_report = state["sentiment_report"]
         trader_plan = state["investment_plan"]
+        exchange_state_summary = state.get("exchange_state_summary", "")
+        bot_state_summary = state.get("bot_state_summary", "")
 
         curr_situation = f"{market_research_report}\n\n{sentiment_report}\n\n{news_report}\n\n{fundamentals_report}"
         past_memories = memory.get_memories(curr_situation, n_matches=2)
@@ -66,7 +68,9 @@ Your highest priority is format compliance. You must output the `STRUCTURED_DECI
 - Trader's proposed plan: **{trader_plan_context}**
 - Lessons from past decisions: **{lessons}**
 - Trade date: **{state["trade_date"]}**
-        - Required time horizon for the structured output: **{analysis_timeframe}**
+- Required time horizon for the structured output: **{analysis_timeframe}**
+- Current exchange/account state: **{exchange_state_summary or 'No exchange state provided.'}**
+- Current bot state: **{bot_state_summary or 'No bot state provided.'}**
 
 **Required Output Structure:**
 1. `STRUCTURED_DECISION`
@@ -85,7 +89,9 @@ Your highest priority is format compliance. You must output the `STRUCTURED_DECI
   "stop_loss": 0.0,
   "take_profit": 0.0,
   "invalidation": "What would prove the trade wrong.",
-  "size_hint": "small | medium | large"
+  "size_hint": "small | medium | large",
+  "setup_expiry_bars": 2,
+  "position_instruction": "OPEN | HOLD | CLOSE | CANCEL_ENTRY | NO_ACTION"
 }}
 ```
 2. `EXECUTIVE_SUMMARY`
@@ -100,6 +106,8 @@ Rules for the JSON:
 - For `FLAT`, set both `stop_loss` and `take_profit` to null.
 - For `LONG` and `SHORT`, both `stop_loss` and `take_profit` are mandatory numeric prices.
 - {entry_rules}
+- Use `position_instruction` to explicitly describe how the bot should handle existing positions or pending orders.
+- Use `setup_expiry_bars` for directional setups that wait on a trigger; omit or null for `NO_ACTION`, `HOLD`, or immediate `MARKET` entries.
 - If the correct stance is defensive or capital-preservation only, use `FLAT` instead of prose like "stay in cash" or "maintain liquidity."
 
 ---

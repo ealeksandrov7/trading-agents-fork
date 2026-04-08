@@ -1,0 +1,16 @@
+{
+  "symbol": "BTC",
+  "timestamp": "2026-04-07 13:59",
+  "action": "FLAT",
+  "entry_mode": "MARKET",
+  "entry_price": null,
+  "entry_zone_low": null,
+  "entry_zone_high": null,
+  "confidence": 0.63,
+  "thesis_summary": "Stay flat on BTC-USD for the 1h because the failed-breakout bearish case is credible but not sufficiently confirmed to justify fresh risk in elevated volatility.",
+  "time_horizon": "1h",
+  "stop_loss": null,
+  "take_profit": null,
+  "invalidation": "The flat stance is wrong if BTC-USD prints a clean 1h confirmation move either by breaking the latest 1h pullback low for a valid tactical short or by reclaiming and holding above the failed-breakout high for a renewed long bias.",
+  "size_hint": "small"
+}

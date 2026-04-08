@@ -10,11 +10,11 @@ DEFAULT_CONFIG = {
     # LLM settings
     "llm_provider": "openai",
     "deep_think_llm": "gpt-5.4",
-    "quick_think_llm": "gpt-5.4-mini",
+    "quick_think_llm": "gpt-5.4",
     "backend_url": "https://api.openai.com/v1",
     # Provider-specific thinking configuration
     "google_thinking_level": None,      # "high", "minimal", etc.
-    "openai_reasoning_effort": None,    # "medium", "high", "low"
+    "openai_reasoning_effort": "medium",    # "medium", "high", "low"
     "anthropic_effort": None,           # "high", "medium", "low"
     # Output language for analyst reports and final decision
     # Internal agent debate stays in English for reasoning quality
@@ -34,6 +34,7 @@ DEFAULT_CONFIG = {
     "decision_timeframe": "4h",
     "max_risk_per_trade_pct": 0.01,
     "max_leverage": 2,
+    "min_notional_usd": 10.0,
     "single_position_mode": True,
     "require_manual_live_confirm": True,
     "paper_ledger_path": os.getenv(
@@ -41,6 +42,21 @@ DEFAULT_CONFIG = {
     ),
     "hyperliquid_base_url": os.getenv("HYPERLIQUID_BASE_URL"),
     "hyperliquid_wallet_address": os.getenv("HYPERLIQUID_WALLET_ADDRESS"),
+    "hyperliquid_testnet": os.getenv("HYPERLIQUID_TESTNET", "false").lower() == "true",
+    # Autonomous bot settings
+    "bot_symbol": os.getenv("TRADINGAGENTS_BOT_SYMBOL", "BTC-USD"),
+    "bot_analysis_interval_minutes": 240,
+    "bot_reconcile_interval_seconds": 60,
+    "bot_setup_expiry_bars_default": 3,
+    "bot_default_intraday_analysts": ["market"],
+    "bot_default_swing_analysts": ["market", "social", "news", "fundamentals"],
+    "bot_state_path": os.getenv("TRADINGAGENTS_BOT_STATE_PATH", "./results/bot_state.json"),
+    "bot_fail_closed": True,
+    "max_entry_distance_pct_by_timeframe": {
+        "1h": 0.05,
+        "4h": 0.08,
+        "1d": 0.15,
+    },
     # Data vendor configuration
     # Category-level configuration (default for all tools in category)
     "data_vendors": {
