@@ -44,10 +44,10 @@ class RiskEngine:
             raise RiskEvaluationError(f"symbol {symbol} is not allowed")
         if reference_price <= 0:
             raise RiskEvaluationError("reference price must be positive")
-        if self.bankroll <= 0:
-            raise RiskEvaluationError("bankroll must be positive")
         if decision.action == TradeAction.FLAT:
             return self._build_flat_intent(decision, reference_price, mode, open_position)
+        if self.bankroll <= 0:
+            raise RiskEvaluationError("bankroll must be positive")
         if decision.time_horizon.strip().lower() != self.decision_timeframe.lower():
             raise RiskEvaluationError(
                 f"decision time horizon must be {self.decision_timeframe}"
@@ -199,5 +199,7 @@ class RiskEngine:
         if decision.entry_mode == EntryMode.LIMIT_ZONE:
             assert decision.entry_zone_low is not None
             assert decision.entry_zone_high is not None
-            return (decision.entry_zone_low + decision.entry_zone_high) / 2
+            if decision.action == TradeAction.SHORT:
+                return decision.entry_zone_low
+            return decision.entry_zone_high
         return market_price

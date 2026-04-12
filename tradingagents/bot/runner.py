@@ -5,6 +5,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
+from langchain_core.messages import ToolMessage
+
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.execution import (
     ExchangeStateSnapshot,
@@ -18,6 +20,7 @@ from tradingagents.execution import (
     TradeAction,
 )
 from tradingagents.graph.trading_graph import TradingAgentsGraph
+from tradingagents.agents.utils.core_stock_tools import TOOL_ERROR_PREFIX
 
 from .models import BotActionPlan, BotConfig, BotState
 from .state import BotStateStore
@@ -98,6 +101,19 @@ class BotRunner:
 
         self._emit(f"[bot] running full analysis for {decision_timestamp} UTC")
         final_state = self._run_decision(state, snapshot, decision_timestamp)
+        tool_errors = self._extract_tool_errors(final_state)
+        if tool_errors:
+            for tool_error in tool_errors:
+                self._emit(f"[bot] tool failure: {tool_error}")
+            events = self.store.append_event(
+                state,
+                events,
+                event_type="analysis_degraded",
+                message="Analysis completed with tool failures.",
+                payload={"tool_errors": tool_errors},
+            )
+        else:
+            self._emit("[bot] analysis completed cleanly")
         action = final_state.get("final_trade_action") or {}
         if not action:
             events = self.store.append_event(
@@ -122,8 +138,22 @@ class BotRunner:
             events,
             event_type="plan",
             message=plan.reason,
-            payload={"action": plan.action, "decision": action},
+            payload={"action": plan.action, "decision": action, "tool_errors": tool_errors},
         )
+
+        if tool_errors and plan.action not in {"NO_ACTION", "CANCEL_PENDING", "CLOSE_POSITION"}:
+            self._emit("[bot] live entry blocked due to tool failures in the analysis phase")
+            events = self.store.append_event(
+                state,
+                events,
+                event_type="entry_blocked_tool_failure",
+                message="Live entry blocked because required analysis tools failed.",
+                payload={"tool_errors": tool_errors, "decision": action},
+            )
+            state.last_decision_timestamp = decision_timestamp
+            state.last_decision_action = action
+            self.store.save(state, events)
+            return
 
         if plan.action == "NO_ACTION":
             self._emit(f"[bot] no action: {plan.reason}")
@@ -152,6 +182,17 @@ class BotRunner:
                 open_position=self._position_from_state(state),
             )
             preview = self.exchange.execute(close_intent)
+            if preview.status == "rejected":
+                self._emit(f"[bot] close rejected for {close_intent.symbol}: {preview.message}")
+                events = self.store.append_event(
+                    state,
+                    events,
+                    event_type="close_rejected",
+                    message=preview.message,
+                    payload=preview.model_dump(),
+                )
+                self.store.save(state, events)
+                return
             self._emit(
                 f"[bot] submitted close for {close_intent.symbol} size={close_intent.size:.6f} "
                 f"at ref={close_intent.reference_price:.2f}"
@@ -179,6 +220,19 @@ class BotRunner:
             return
 
         preview = self.exchange.execute(intent)
+        if preview.status == "rejected":
+            self._emit(f"[bot] entry rejected for {intent.symbol}: {preview.message}")
+            events = self.store.append_event(
+                state,
+                events,
+                event_type="entry_rejected",
+                message=preview.message,
+                payload=preview.model_dump(),
+            )
+            state.last_decision_timestamp = decision_timestamp
+            state.last_decision_action = action
+            self.store.save(state, events)
+            return
         self._emit(
             f"[bot] submitted {intent.action.value} {intent.symbol} size={intent.size:.6f} "
             f"entry_mode={intent.entry_mode.value} ref={intent.reference_price:.2f}"
@@ -384,6 +438,32 @@ class BotRunner:
             or snapshot.equity
             or 0.0
         )
+
+    def _extract_tool_errors(self, final_state: dict) -> list[str]:
+        messages = final_state.get("messages") or []
+        errors: list[str] = []
+        for message in messages:
+            if not isinstance(message, ToolMessage):
+                continue
+            content = message.content
+            if isinstance(content, str):
+                texts = [content]
+            elif isinstance(content, list):
+                texts = [str(item) for item in content]
+            else:
+                texts = [str(content)]
+            for text in texts:
+                if TOOL_ERROR_PREFIX in text:
+                    for line in text.splitlines():
+                        if TOOL_ERROR_PREFIX in line:
+                            errors.append(line.strip())
+        deduped: list[str] = []
+        seen = set()
+        for error in errors:
+            if error not in seen:
+                seen.add(error)
+                deduped.append(error)
+        return deduped
 
 
 def build_bot_runtime_config() -> dict:

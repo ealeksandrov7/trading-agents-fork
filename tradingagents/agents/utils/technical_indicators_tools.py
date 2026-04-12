@@ -5,6 +5,7 @@ from tradingagents.dataflows.stockstats_utils import (
     get_analysis_timeframe,
     get_indicator_analysis_window_days,
 )
+from tradingagents.agents.utils.core_stock_tools import TOOL_ERROR_PREFIX
 
 @tool
 def get_indicators(
@@ -36,9 +37,29 @@ def get_indicators(
     results = []
     for ind in indicators:
         try:
-            results.append(
-                route_to_vendor("get_indicators", symbol, ind, curr_date, effective_lookback)
-            )
+            result = route_to_vendor("get_indicators", symbol, ind, curr_date, effective_lookback)
+            if isinstance(result, str):
+                lowered = result.lower()
+                if any(
+                    marker in lowered
+                    for marker in (
+                        "error getting stockstats",
+                        "error getting bulk stockstats",
+                        "possibly delisted",
+                        "failed download",
+                        "quote not found",
+                        "no data found for symbol",
+                    )
+                ):
+                    result = (
+                        f"{TOOL_ERROR_PREFIX} tool=get_indicators symbol={symbol} "
+                        f"indicator={ind} detail={result}"
+                    )
+            results.append(result)
         except ValueError as e:
             results.append(str(e))
+        except Exception as e:
+            results.append(
+                f"{TOOL_ERROR_PREFIX} tool=get_indicators symbol={symbol} indicator={ind} detail={e}"
+            )
     return "\n\n".join(results)

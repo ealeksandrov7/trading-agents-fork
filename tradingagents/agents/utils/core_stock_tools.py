@@ -2,6 +2,26 @@ from langchain_core.tools import tool
 from typing import Annotated
 from tradingagents.dataflows.interface import route_to_vendor
 
+TOOL_ERROR_PREFIX = "[TOOL_ERROR]"
+
+
+def _format_tool_error(tool_name: str, symbol: str, detail: str) -> str:
+    return f"{TOOL_ERROR_PREFIX} tool={tool_name} symbol={symbol} detail={detail}"
+
+
+def _looks_like_data_failure(result: str) -> bool:
+    lowered = result.lower()
+    failure_markers = (
+        "no data found for symbol",
+        "possibly delisted",
+        "failed download",
+        "quote not found",
+        "error getting",
+        "runtimeerror:",
+        "traceback",
+    )
+    return any(marker in lowered for marker in failure_markers)
+
 
 @tool
 def get_stock_data(
@@ -27,4 +47,10 @@ def get_stock_data(
         - 1d: 30 to 120 calendar days
         Broader trend context for intraday runs should come from indicators and the higher-timeframe anchor, not months of hourly CSV.
     """
-    return route_to_vendor("get_stock_data", symbol, start_date, end_date)
+    try:
+        result = route_to_vendor("get_stock_data", symbol, start_date, end_date)
+    except Exception as exc:
+        return _format_tool_error("get_stock_data", symbol, str(exc))
+    if isinstance(result, str) and _looks_like_data_failure(result):
+        return _format_tool_error("get_stock_data", symbol, result)
+    return result

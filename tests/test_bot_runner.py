@@ -3,6 +3,8 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from langchain_core.messages import ToolMessage
+
 from tradingagents.bot.models import BotConfig, BotState
 from tradingagents.bot.runner import BotRunner
 from tradingagents.bot.state import BotStateStore
@@ -11,6 +13,8 @@ from tradingagents.execution import (
     ExchangeOrder,
     ExchangeStateSnapshot,
     ExecutionMode,
+    OrderPreview,
+    OrderStatus,
     Position,
     TradeAction,
 )
@@ -216,6 +220,147 @@ class BotRunnerPlannerTests(unittest.TestCase):
             state, _ = BotStateStore(Path(config["bot_state_path"])).load()
             self.assertIsNone(state.last_decision_timestamp)
             self.assertEqual(executor.calls, 1)
+
+    def test_rejected_live_submit_does_not_create_active_order_state(self):
+        class RejectingExecutor:
+            def __init__(self):
+                self.calls = 0
+
+            def get_exchange_state_snapshot(self, symbol):
+                return ExchangeStateSnapshot(
+                    wallet_address="0xabc",
+                    equity=1000,
+                    available_balance=1000,
+                    spot_usdc_balance=1000,
+                    mark_prices={"BTC": 70000},
+                    positions=[],
+                    open_orders=[],
+                    fetched_at=datetime.now(timezone.utc).isoformat(),
+                )
+
+            def execute(self, intent):
+                self.calls += 1
+                return OrderPreview(
+                    status=OrderStatus.REJECTED,
+                    mode=ExecutionMode.LIVE,
+                    symbol="BTC",
+                    action=TradeAction.SHORT,
+                    message="Live bracket order rejected: Order has invalid size.",
+                    reference_price=70200,
+                    size=0.024849,
+                    leverage=2,
+                )
+
+            def cancel_order(self, symbol, order_id):
+                return {"status": "ok"}
+
+        class FixedRunner(BotRunner):
+            def _latest_analysis_bar(self):
+                return "2026-04-07 12:00"
+
+            def _run_decision(self, state, snapshot, decision_timestamp):
+                return {
+                    "final_trade_action": {
+                        "symbol": "BTC",
+                        "action": "SHORT",
+                        "entry_mode": "LIMIT",
+                        "entry_price": 70200,
+                        "confidence": 0.55,
+                        "thesis_summary": "fade resistance",
+                        "time_horizon": "1h",
+                        "stop_loss": 71000,
+                        "take_profit": 68500,
+                        "invalidation": "hourly breakout",
+                        "position_instruction": "OPEN",
+                    }
+                }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = DEFAULT_CONFIG.copy()
+            config["bot_state_path"] = str(Path(tmpdir) / "bot_state.json")
+            executor = RejectingExecutor()
+            runner = FixedRunner(
+                config=config,
+                bot_config=BotConfig(symbol="BTC-USD", timeframe="1h", once=True),
+                executor=executor,
+            )
+
+            runner.run_once()
+
+            state, events = BotStateStore(Path(config["bot_state_path"])).load()
+            self.assertEqual(state.last_decision_timestamp, "2026-04-07 12:00")
+            self.assertIsNone(state.active_order_id)
+            self.assertIsNone(state.active_order_intent)
+            self.assertEqual(executor.calls, 1)
+            self.assertEqual(events[-1].event_type, "entry_rejected")
+
+    def test_tool_failure_blocks_live_entry_submission(self):
+        class StubExecutor:
+            def __init__(self):
+                self.calls = 0
+
+            def get_exchange_state_snapshot(self, symbol):
+                return ExchangeStateSnapshot(
+                    wallet_address="0xabc",
+                    equity=1000,
+                    available_balance=1000,
+                    spot_usdc_balance=1000,
+                    mark_prices={"BTC": 70000},
+                    positions=[],
+                    open_orders=[],
+                    fetched_at=datetime.now(timezone.utc).isoformat(),
+                )
+
+            def execute(self, intent):
+                self.calls += 1
+                raise AssertionError("execute should not be called when tool failures are present")
+
+            def cancel_order(self, symbol, order_id):
+                return {"status": "ok"}
+
+        class FixedRunner(BotRunner):
+            def _latest_analysis_bar(self):
+                return "2026-04-07 12:00"
+
+            def _run_decision(self, state, snapshot, decision_timestamp):
+                return {
+                    "messages": [
+                        ToolMessage(
+                            content="[TOOL_ERROR] tool=get_stock_data symbol=BTC-USD detail=No data found for symbol 'BTC-USD'",
+                            tool_call_id="call-1",
+                        )
+                    ],
+                    "final_trade_action": {
+                        "symbol": "BTC",
+                        "action": "SHORT",
+                        "entry_mode": "LIMIT",
+                        "entry_price": 70200,
+                        "confidence": 0.55,
+                        "thesis_summary": "fade resistance",
+                        "time_horizon": "1h",
+                        "stop_loss": 71000,
+                        "take_profit": 68500,
+                        "invalidation": "hourly breakout",
+                        "position_instruction": "OPEN",
+                    },
+                }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = DEFAULT_CONFIG.copy()
+            config["bot_state_path"] = str(Path(tmpdir) / "bot_state.json")
+            executor = StubExecutor()
+            runner = FixedRunner(
+                config=config,
+                bot_config=BotConfig(symbol="BTC-USD", timeframe="1h", once=True),
+                executor=executor,
+            )
+
+            runner.run_once()
+
+            state, events = BotStateStore(Path(config["bot_state_path"])).load()
+            self.assertEqual(state.last_decision_timestamp, "2026-04-07 12:00")
+            self.assertEqual(executor.calls, 0)
+            self.assertEqual(events[-1].event_type, "entry_blocked_tool_failure")
 
 
 if __name__ == "__main__":

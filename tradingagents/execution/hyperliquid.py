@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_DOWN
 from typing import Optional
 
 from eth_account import Account
@@ -27,6 +28,7 @@ class HyperliquidExecutionError(RuntimeError):
 
 
 DEFAULT_MARKET_SLIPPAGE = 0.05
+LIVE_SIZE_DECIMALS = 5
 
 
 class HyperliquidExecutor:
@@ -173,75 +175,119 @@ class HyperliquidExecutor:
                 "live execution requires HYPERLIQUID_PRIVATE_KEY"
             )
 
+        normalized_intent = intent.model_copy(update={"size": self._normalize_size(intent.symbol, intent.size)})
         self.exchange.update_leverage(intent.leverage, intent.symbol, is_cross=True)
 
-        if intent.action == TradeAction.FLAT:
-            raw = self.exchange.market_close(intent.symbol, sz=intent.size)
+        if normalized_intent.action == TradeAction.FLAT:
+            raw = self.exchange.market_close(normalized_intent.symbol, sz=normalized_intent.size)
+            errors = self._extract_order_errors(raw)
+            if errors:
+                return OrderPreview(
+                    status=OrderStatus.REJECTED,
+                    mode=ExecutionMode.LIVE,
+                    symbol=normalized_intent.symbol,
+                    action=normalized_intent.action,
+                    message=f"Live market close rejected: {errors[0]}",
+                    reference_price=normalized_intent.reference_price,
+                    size=normalized_intent.size,
+                    leverage=normalized_intent.leverage,
+                    raw_response=raw,
+                )
             return OrderPreview(
                 status=OrderStatus.FILLED,
                 mode=ExecutionMode.LIVE,
-                symbol=intent.symbol,
-                action=intent.action,
+                symbol=normalized_intent.symbol,
+                action=normalized_intent.action,
                 message="Submitted live market close.",
-                reference_price=intent.reference_price,
-                size=intent.size,
-                leverage=intent.leverage,
+                reference_price=normalized_intent.reference_price,
+                size=normalized_intent.size,
+                leverage=normalized_intent.leverage,
                 raw_response=raw,
             )
 
-        if intent.stop_loss is not None and intent.take_profit is not None:
+        if normalized_intent.stop_loss is not None and normalized_intent.take_profit is not None:
             raw = self.exchange.bulk_orders(
-                self._build_bracket_order_requests(intent),
+                self._build_bracket_order_requests(normalized_intent),
                 grouping="normalTpsl",
             )
+            errors = self._extract_order_errors(raw)
+            if errors:
+                return OrderPreview(
+                    status=OrderStatus.REJECTED,
+                    mode=ExecutionMode.LIVE,
+                    symbol=normalized_intent.symbol,
+                    action=normalized_intent.action,
+                    message=f"Live bracket order rejected: {errors[0]}",
+                    reference_price=self._resolve_entry_reference_price(normalized_intent),
+                    size=normalized_intent.size,
+                    leverage=normalized_intent.leverage,
+                    stop_loss=normalized_intent.stop_loss,
+                    take_profit=normalized_intent.take_profit,
+                    raw_response=raw,
+                )
             return OrderPreview(
                 status=OrderStatus.PREVIEW,
                 mode=ExecutionMode.LIVE,
-                symbol=intent.symbol,
-                action=intent.action,
+                symbol=normalized_intent.symbol,
+                action=normalized_intent.action,
                 message="Submitted live entry with native TP/SL bracket.",
-                reference_price=self._resolve_entry_reference_price(intent),
-                size=intent.size,
-                leverage=intent.leverage,
-                stop_loss=intent.stop_loss,
-                take_profit=intent.take_profit,
+                reference_price=self._resolve_entry_reference_price(normalized_intent),
+                size=normalized_intent.size,
+                leverage=normalized_intent.leverage,
+                stop_loss=normalized_intent.stop_loss,
+                take_profit=normalized_intent.take_profit,
                 raw_response=raw,
                 order_id=self._extract_order_id(raw, index=0),
             )
 
-        if intent.entry_mode == EntryMode.MARKET:
+        if normalized_intent.entry_mode == EntryMode.MARKET:
             raw = self.exchange.market_open(
-                intent.symbol,
-                is_buy=intent.action == TradeAction.LONG,
-                sz=intent.size,
+                normalized_intent.symbol,
+                is_buy=normalized_intent.action == TradeAction.LONG,
+                sz=normalized_intent.size,
             )
             message = "Submitted live market order."
             status = OrderStatus.FILLED
         else:
-            limit_price = self._resolve_limit_price(intent)
+            limit_price = self._resolve_limit_price(normalized_intent)
             raw = self.exchange.order(
-                intent.symbol,
-                is_buy=intent.action == TradeAction.LONG,
-                sz=intent.size,
+                normalized_intent.symbol,
+                is_buy=normalized_intent.action == TradeAction.LONG,
+                sz=normalized_intent.size,
                 limit_px=limit_price,
                 order_type={"limit": {"tif": "Gtc"}},
                 reduce_only=False,
             )
             message = "Submitted live resting limit order."
             status = OrderStatus.PREVIEW
+        errors = self._extract_order_errors(raw)
+        if errors:
+            return OrderPreview(
+                status=OrderStatus.REJECTED,
+                mode=ExecutionMode.LIVE,
+                symbol=normalized_intent.symbol,
+                action=normalized_intent.action,
+                message=f"Live order rejected: {errors[0]}",
+                reference_price=self._resolve_entry_reference_price(normalized_intent),
+                size=normalized_intent.size,
+                leverage=normalized_intent.leverage,
+                stop_loss=normalized_intent.stop_loss,
+                take_profit=normalized_intent.take_profit,
+                raw_response=raw,
+            )
         return OrderPreview(
             status=status,
             mode=ExecutionMode.LIVE,
-            symbol=intent.symbol,
-            action=intent.action,
+            symbol=normalized_intent.symbol,
+            action=normalized_intent.action,
             message=message,
-            reference_price=self._resolve_limit_price(intent)
-            if intent.entry_mode != EntryMode.MARKET
-            else intent.reference_price,
-            size=intent.size,
-            leverage=intent.leverage,
-            stop_loss=intent.stop_loss,
-            take_profit=intent.take_profit,
+            reference_price=self._resolve_limit_price(normalized_intent)
+            if normalized_intent.entry_mode != EntryMode.MARKET
+            else normalized_intent.reference_price,
+            size=normalized_intent.size,
+            leverage=normalized_intent.leverage,
+            stop_loss=normalized_intent.stop_loss,
+            take_profit=normalized_intent.take_profit,
             raw_response=raw,
             order_id=self._extract_order_id(raw),
         )
@@ -312,7 +358,9 @@ class HyperliquidExecutor:
         if intent.limit_price is not None:
             return intent.limit_price
         if intent.limit_zone_low is not None and intent.limit_zone_high is not None:
-            return (intent.limit_zone_low + intent.limit_zone_high) / 2
+            if intent.action == TradeAction.SHORT:
+                return intent.limit_zone_low
+            return intent.limit_zone_high
         return intent.reference_price
 
     def _extract_order_id(self, raw: dict | None, index: int = 0) -> Optional[str]:
@@ -339,6 +387,47 @@ class HyperliquidExecutor:
             if isinstance(filled, dict) and filled.get("oid") is not None:
                 order_ids.append(str(filled["oid"]))
         return order_ids
+
+    def _extract_order_errors(self, raw: dict | None) -> list[str]:
+        if not isinstance(raw, dict):
+            return []
+        statuses = raw.get("response", {}).get("data", {}).get("statuses")
+        if not isinstance(statuses, list):
+            return []
+        errors: list[str] = []
+        for status in statuses:
+            if isinstance(status, dict) and status.get("error"):
+                errors.append(str(status["error"]))
+        return errors
+
+    def _normalize_size(self, symbol: str, size: float) -> float:
+        decimals = LIVE_SIZE_DECIMALS
+        quantized = Decimal(str(size)).quantize(Decimal(10) ** -decimals, rounding=ROUND_DOWN)
+        normalized = float(quantized)
+        if normalized <= 0:
+            raise HyperliquidExecutionError(
+                f"size {size} rounds to zero for {symbol} at {decimals} size decimals"
+            )
+        return normalized
+
+    def _size_decimals(self, symbol: str) -> Optional[int]:
+        return LIVE_SIZE_DECIMALS
+
+    def _metadata_size_decimals(self, symbol: str) -> Optional[int]:
+        name_to_asset = getattr(self.info, "name_to_asset", None)
+        asset_to_sz_decimals = getattr(self.info, "asset_to_sz_decimals", None)
+        if not isinstance(name_to_asset, dict) or not isinstance(asset_to_sz_decimals, dict):
+            return None
+        asset = name_to_asset.get(symbol)
+        if asset is None:
+            return None
+        decimals = asset_to_sz_decimals.get(asset)
+        if decimals is None:
+            return None
+        try:
+            return int(decimals)
+        except (TypeError, ValueError):
+            return None
 
     def _safe_spot_meta(self) -> dict:
         # The upstream SDK eagerly assumes a populated spot universe during Info()/Exchange()

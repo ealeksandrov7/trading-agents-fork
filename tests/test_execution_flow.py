@@ -13,6 +13,7 @@ from tradingagents.execution import (
     HyperliquidExecutor,
     OrderIntent,
     PaperBroker,
+    Position,
     RiskEngine,
     RiskEvaluationError,
     TradeAction,
@@ -224,6 +225,41 @@ class RiskEngineTests(unittest.TestCase):
         )
         self.assertEqual(intent.action, TradeAction.FLAT)
         self.assertEqual(intent.size, 0.0)
+
+    def test_flat_with_open_position_does_not_require_positive_bankroll(self):
+        engine = RiskEngine(
+            bankroll=0.0,
+            max_risk_per_trade_pct=0.01,
+            max_leverage=2,
+            min_notional_usd=10.0,
+            allowed_symbols=("BTC", "ETH"),
+            single_position_mode=True,
+            decision_timeframe="1h",
+        )
+        decision = DecisionParser.parse(
+            OBSERVE_HOLD_FLAT,
+            fallback_symbol="BTC-USD",
+            fallback_timestamp="2026-04-06 11:00",
+            fallback_time_horizon="1h",
+        )
+        position = Position(
+            symbol="BTC",
+            side=TradeAction.LONG,
+            size=0.01,
+            entry_price=70000,
+            stop_loss=None,
+            take_profit=None,
+            opened_at="2026-04-06T10:00:00+00:00",
+            mode=ExecutionMode.LIVE,
+        )
+        intent = engine.build_order_intent(
+            decision,
+            reference_price=69900,
+            mode=ExecutionMode.LIVE,
+            open_position=position,
+        )
+        self.assertEqual(intent.action, TradeAction.FLAT)
+        self.assertEqual(intent.size, 0.01)
 
 
 class PaperBrokerTests(unittest.TestCase):
@@ -451,6 +487,7 @@ class HyperliquidExecutorTests(unittest.TestCase):
         parent, tp, sl = exchange.bulk_request
         self.assertEqual(parent["coin"], "BTC")
         self.assertFalse(parent["is_buy"])
+        self.assertEqual(parent["limit_px"], 69200)
         self.assertEqual(parent["order_type"], {"limit": {"tif": "Gtc"}})
         self.assertFalse(parent["reduce_only"])
         self.assertTrue(tp["is_buy"])
@@ -502,6 +539,92 @@ class HyperliquidExecutorTests(unittest.TestCase):
         self.assertEqual(parent["limit_px"], 68100.0)
         self.assertEqual(preview.order_id, "201")
 
+    def test_live_orders_round_size_down_to_five_decimals(self):
+        class StubExchange:
+            def __init__(self):
+                self.bulk_request = None
+
+            def update_leverage(self, leverage, symbol, is_cross=True):
+                pass
+
+            def bulk_orders(self, order_requests, grouping="na"):
+                self.bulk_request = order_requests
+                return {"response": {"data": {"statuses": [{"resting": {"oid": 401}}]}}}
+
+        exchange = StubExchange()
+        executor = self._build_executor(exchange)
+        intent = OrderIntent(
+            mode=ExecutionMode.LIVE,
+            symbol="BTC",
+            action=TradeAction.LONG,
+            size=0.019839,
+            reference_price=72900,
+            entry_mode=EntryMode.LIMIT,
+            limit_price=72900,
+            leverage=2,
+            stop_loss=72400,
+            take_profit=73900,
+            confidence=0.62,
+            thesis_summary="Buy the reclaim.",
+            time_horizon="1h",
+            invalidation="Lose support.",
+            decision_timestamp="2026-04-10 20:00",
+            rationale="test",
+        )
+
+        preview = executor.execute(intent)
+
+        self.assertEqual(exchange.bulk_request[0]["sz"], 0.01983)
+        self.assertEqual(exchange.bulk_request[1]["sz"], 0.01983)
+        self.assertEqual(exchange.bulk_request[2]["sz"], 0.01983)
+        self.assertEqual(preview.size, 0.01983)
+
+    def test_limit_zone_price_uses_zone_high_for_longs_and_zone_low_for_shorts(self):
+        engine = RiskEngine(
+            bankroll=1000,
+            max_risk_per_trade_pct=0.01,
+            max_leverage=2,
+            min_notional_usd=10.0,
+            allowed_symbols=("BTC", "ETH"),
+            single_position_mode=True,
+            decision_timeframe="1h",
+        )
+        long_decision = DecisionParser.parse(MALFORMED_JSON_DECISION).model_copy(
+            update={
+                "action": TradeAction.LONG,
+                "entry_zone_low": 72800.0,
+                "entry_zone_high": 73000.0,
+                "stop_loss": 72400.0,
+                "take_profit": 73900.0,
+                "time_horizon": "1h",
+            }
+        )
+        short_decision = long_decision.model_copy(
+            update={
+                "action": TradeAction.SHORT,
+                "entry_zone_low": 71400.0,
+                "entry_zone_high": 71600.0,
+                "stop_loss": 71900.0,
+                "take_profit": 70500.0,
+            }
+        )
+
+        long_intent = engine.build_order_intent(
+            long_decision,
+            reference_price=72900.0,
+            mode=ExecutionMode.PAPER,
+        )
+        short_intent = engine.build_order_intent(
+            short_decision,
+            reference_price=71500.0,
+            mode=ExecutionMode.PAPER,
+        )
+
+        self.assertEqual(engine._resolve_entry_reference_price(long_decision, 72900.0), 73000.0)
+        self.assertEqual(engine._resolve_entry_reference_price(short_decision, 71500.0), 71400.0)
+        self.assertEqual(long_intent.limit_zone_high, 73000.0)
+        self.assertEqual(short_intent.limit_zone_low, 71400.0)
+
     def test_extract_order_ids_ignores_non_dict_status_entries(self):
         executor = self._build_executor(exchange=None)
         raw = {
@@ -516,6 +639,50 @@ class HyperliquidExecutorTests(unittest.TestCase):
             }
         }
         self.assertEqual(executor._extract_order_ids(raw), ["301", "302"])
+
+    def test_live_bracket_order_returns_rejected_when_exchange_reports_error(self):
+        class StubExchange:
+            def update_leverage(self, leverage, symbol, is_cross=True):
+                pass
+
+            def bulk_orders(self, order_requests, grouping="na"):
+                return {
+                    "status": "ok",
+                    "response": {
+                        "data": {
+                            "statuses": [
+                                {"error": "Order has invalid size."},
+                            ]
+                        }
+                    },
+                }
+
+        executor = self._build_executor(StubExchange())
+        intent = OrderIntent(
+            mode=ExecutionMode.LIVE,
+            symbol="BTC",
+            action=TradeAction.SHORT,
+            size=0.024849,
+            reference_price=71357.0,
+            entry_mode=EntryMode.LIMIT_ZONE,
+            limit_zone_low=71300,
+            limit_zone_high=71400,
+            leverage=2,
+            stop_loss=71900,
+            take_profit=70500,
+            confidence=0.61,
+            thesis_summary="Short the rejection.",
+            time_horizon="1h",
+            invalidation="Break back above the level.",
+            decision_timestamp="2026-04-09 12:00",
+            rationale="test",
+        )
+
+        preview = executor.execute(intent)
+
+        self.assertEqual(preview.status, "rejected")
+        self.assertIn("invalid size", preview.message.lower())
+        self.assertIsNone(preview.order_id)
 
 
 class TimeframeResampleTests(unittest.TestCase):
