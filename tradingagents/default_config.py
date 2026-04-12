@@ -75,6 +75,11 @@ DEFAULT_CONFIG = {
     "bot_range_fade_max_width_atr": 5.5,
     "bot_range_fade_stop_buffer_atr": 0.2,
     "bot_range_fade_target_buffer_atr": 0.35,
+    "bot_deterministic_trend_pullback_target_r_multiple": 2.0,
+    "bot_deterministic_trend_pullback_expiry_bars": 5,
+    "bot_deterministic_range_fade_target_mode": "reference",
+    "bot_deterministic_range_fade_target_r_multiple": 2.0,
+    "bot_deterministic_range_fade_expiry_bars": 3,
     "bot_replay_initial_equity": 1000.0,
     "max_entry_distance_pct_by_timeframe": {
         "1h": 0.05,

@@ -974,6 +974,42 @@ class BotRunnerPlannerTests(unittest.TestCase):
             self.assertEqual(result["mode"], "candidate-only")
             self.assertEqual(result["summary"]["llm_evaluated"], 0)
 
+    def test_deterministic_only_replay_skips_graph(self):
+        class ReplayRunner(BotRunner):
+            def _load_replay_bars(self, symbol, start_timestamp, end_timestamp, *, data_source="vendor"):
+                base = pd.Timestamp("2026-04-07 00:00", tz="UTC")
+                rows = []
+                for idx in range(80):
+                    ts = base + pd.Timedelta(hours=idx)
+                    close = 70000.0 + idx * 20.0
+                    rows.append(
+                        {
+                            "Date": ts,
+                            "Open": close - 10.0,
+                            "High": close + 40.0,
+                            "Low": close - 40.0,
+                            "Close": close,
+                            "Volume": 1000 + idx,
+                        }
+                    )
+                return pd.DataFrame(rows)
+
+            def _run_decision(self, state, snapshot, decision_timestamp):
+                raise AssertionError("graph should not run in deterministic-only replay")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = DEFAULT_CONFIG.copy()
+            config["bot_state_path"] = str(Path(tmpdir) / "bot_state.json")
+            runner = ReplayRunner(
+                config=config,
+                bot_config=BotConfig(symbol="BTC-USD", timeframe="1h", analysis_interval_minutes=240, once=True),
+                executor=type("StubExecutor", (), {"cancel_order": lambda *args, **kwargs: {}})(),
+            )
+            result = runner.run_replay("2026-04-08 00:00", "2026-04-09 23:00", mode="deterministic-only")
+
+            self.assertEqual(result["mode"], "deterministic-only")
+            self.assertEqual(result["summary"]["llm_evaluated"], 0)
+
     def test_candidate_only_replay_reports_by_strategy(self):
         class ReplayRunner(BotRunner):
             def _load_replay_bars(self, symbol, start_timestamp, end_timestamp, *, data_source="vendor"):
@@ -1045,34 +1081,116 @@ class BotRunnerPlannerTests(unittest.TestCase):
             self.assertIn("range", result["summary"]["top_regime_reasons"])
             self.assertIn("range_fade", result["summary"]["top_candidate_reasons_by_strategy"])
 
+    def test_deterministic_only_replay_generates_actions(self):
+        class ReplayRunner(BotRunner):
+            def _load_replay_bars(self, symbol, start_timestamp, end_timestamp, *, data_source="vendor"):
+                base = pd.Timestamp("2026-04-07 00:00", tz="UTC")
+                rows = []
+                for idx in range(80):
+                    ts = base + pd.Timedelta(hours=idx)
+                    close = 70000.0 + idx * 20.0
+                    rows.append(
+                        {
+                            "Date": ts,
+                            "Open": close - 10.0,
+                            "High": close + 40.0,
+                            "Low": close - 40.0,
+                            "Close": close,
+                            "Volume": 1000 + idx,
+                        }
+                    )
+                return pd.DataFrame(rows)
+
+            def _classify_regime(self, symbol, decision_timestamp, *, replay_bars=None):
+                return RegimeSnapshot(
+                    label="trend_up",
+                    trade_allowed=True,
+                    preferred_action="LONG",
+                    setup_family="trend_pullback",
+                    allowed_setup_families=["trend_pullback"],
+                    current_price=70000,
+                    ema20=69900,
+                    ema50=69200,
+                    atr14=400,
+                    atr_pct=0.0057,
+                    ema20_slope_pct=0.003,
+                    trend_spread_pct=0.01,
+                    realized_vol_24h=0.008,
+                    bar_change_pct=0.001,
+                    pullback_distance_atr=0.25,
+                    pullback_zone_low=69600,
+                    pullback_zone_high=70040,
+                    reason="Uptrend confirmed.",
+                )
+
+            def _detect_candidate(self, symbol, decision_timestamp, regime, *, setup_family=None, replay_bars=None):
+                return CandidateSnapshot(
+                    candidate_setup_present=True,
+                    setup_family="trend_pullback",
+                    direction="LONG",
+                    entry_zone_low=69600,
+                    entry_zone_high=70040,
+                    invalidation_level=69400,
+                    target_reference=71000,
+                    reward_risk_estimate=2.0,
+                    reclaim_confirmed=True,
+                    reason="Deterministic pullback candidate confirmed.",
+                )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = DEFAULT_CONFIG.copy()
+            config["bot_state_path"] = str(Path(tmpdir) / "bot_state.json")
+            runner = ReplayRunner(
+                config=config,
+                bot_config=BotConfig(symbol="BTC-USD", timeframe="1h", analysis_interval_minutes=240, once=True),
+                executor=type("StubExecutor", (), {"cancel_order": lambda *args, **kwargs: {}})(),
+            )
+            result = runner.run_replay("2026-04-08 00:00", "2026-04-09 23:00", mode="deterministic-only")
+
+            self.assertGreater(result["summary"]["deterministic_actions_generated"], 0)
+            self.assertIn("trend_pullback", result["summary"]["top_deterministic_reasons_by_strategy"])
+            self.assertTrue(any(obs["deterministic_action_generated"] for obs in result["observations"]))
+
     def test_replay_summary_includes_reason_breakdowns(self):
         observations = [
             {
                 "regime_label": "low_quality",
                 "regime_reason": "Market structure is ambiguous.",
                 "setup_family": "none",
+                "replay_mode": "deterministic-only",
+                "candidate_setup_present": False,
                 "candidate_reason": "No strategy is eligible.",
+                "deterministic_action_reason": "No strategy is eligible.",
                 "quality_filter_reasons": [],
                 "executed": False,
                 "llm_evaluated": False,
+                "deterministic_action_generated": False,
             },
             {
                 "regime_label": "low_quality",
                 "regime_reason": "Market structure is ambiguous.",
                 "setup_family": "none",
+                "replay_mode": "deterministic-only",
+                "candidate_setup_present": False,
                 "candidate_reason": "No strategy is eligible.",
+                "deterministic_action_reason": "No strategy is eligible.",
                 "quality_filter_reasons": [],
                 "executed": False,
                 "llm_evaluated": False,
+                "deterministic_action_generated": False,
             },
             {
                 "regime_label": "range",
                 "regime_reason": "Range confirmed.",
                 "setup_family": "range_fade",
+                "replay_mode": "deterministic-only",
+                "candidate_setup_present": True,
                 "candidate_reason": "Price is not near a range edge.",
+                "deterministic_action_reason": "Candidate did not produce a deterministic action.",
                 "quality_filter_reasons": ["planned entry is outside the allowed range_fade zone"],
                 "executed": False,
                 "llm_evaluated": False,
+                "deterministic_action_generated": False,
             },
         ]
 
@@ -1081,6 +1199,10 @@ class BotRunnerPlannerTests(unittest.TestCase):
         summary = summarize_replay(observations)
         self.assertEqual(summary["top_regime_reasons"]["low_quality"][0]["count"], 2)
         self.assertEqual(summary["top_candidate_reasons_by_strategy"]["range_fade"][0]["reason"], "Price is not near a range edge.")
+        self.assertEqual(
+            summary["top_deterministic_reasons_by_strategy"]["range_fade"][0]["reason"],
+            "Candidate did not produce a deterministic action.",
+        )
         self.assertEqual(
             summary["top_quality_filter_reasons_by_strategy"]["range_fade"][0]["reason"],
             "planned entry is outside the allowed range_fade zone",

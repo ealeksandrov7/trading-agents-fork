@@ -79,10 +79,12 @@ def summarize_replay(observations: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "executed": 0,
         "skipped": 0,
         "llm_evaluated": 0,
+        "deterministic_actions_generated": 0,
         "by_regime": {},
         "by_strategy": {},
         "top_regime_reasons": {},
         "top_candidate_reasons_by_strategy": {},
+        "top_deterministic_reasons_by_strategy": {},
         "top_quality_filter_reasons_by_strategy": {},
         "regime_behavior": {},
     }
@@ -93,6 +95,8 @@ def summarize_replay(observations: Iterable[dict[str, Any]]) -> dict[str, Any]:
         by_strategy[str(item.get("setup_family") or "none")].append(item)
         if item.get("llm_evaluated"):
             summary["llm_evaluated"] += 1
+        if item.get("deterministic_action_generated"):
+            summary["deterministic_actions_generated"] += 1
         if item.get("executed"):
             summary["executed"] += 1
         else:
@@ -134,6 +138,16 @@ def summarize_replay(observations: Iterable[dict[str, Any]]) -> dict[str, Any]:
         }
         skipped = [item for item in items if not item.get("executed")]
         summary["top_candidate_reasons_by_strategy"][strategy] = _top_reasons(skipped, "candidate_reason")
+        summary["top_deterministic_reasons_by_strategy"][strategy] = _top_reasons(
+            [
+                item
+                for item in items
+                if item.get("replay_mode") == "deterministic-only"
+                and item.get("candidate_setup_present")
+                and not item.get("deterministic_action_generated")
+            ],
+            "deterministic_action_reason",
+        )
         summary["top_quality_filter_reasons_by_strategy"][strategy] = _top_list_reasons(skipped, "quality_filter_reasons")
     return summary
 

@@ -1527,8 +1527,8 @@ def bot_replay(
     if source not in {"vendor", "hyperliquid"}:
         raise typer.BadParameter("data_source must be one of: vendor, hyperliquid")
     replay_mode = mode.strip().lower()
-    if replay_mode not in {"regime-only", "candidate-only", "full-llm"}:
-        raise typer.BadParameter("mode must be one of: regime-only, candidate-only, full-llm")
+    if replay_mode not in {"regime-only", "candidate-only", "deterministic-only", "full-llm"}:
+        raise typer.BadParameter("mode must be one of: regime-only, candidate-only, deterministic-only, full-llm")
 
     config = DEFAULT_CONFIG.copy()
     config["analysis_timeframe"] = timeframe
@@ -1567,6 +1567,7 @@ def bot_replay(
     table.add_row("Strategy filter", result["strategy_filter"] or "all")
     table.add_row("Decisions", str(summary["total_decisions"]))
     table.add_row("LLM evaluated", str(summary["llm_evaluated"]))
+    table.add_row("Deterministic actions", str(summary.get("deterministic_actions_generated", 0)))
     table.add_row("Simulated trades", str(summary["executed"]))
     table.add_row("No trade", str(summary["skipped"]))
     console.print(table)
@@ -1635,6 +1636,9 @@ def bot_replay(
     for strategy_name, reasons in summary.get("top_candidate_reasons_by_strategy", {}).items():
         for item in reasons[:2]:
             reason_table.add_row(f"candidate:{strategy_name}", item["reason"], str(item["count"]))
+    for strategy_name, reasons in summary.get("top_deterministic_reasons_by_strategy", {}).items():
+        for item in reasons[:2]:
+            reason_table.add_row(f"deterministic:{strategy_name}", item["reason"], str(item["count"]))
     for strategy_name, reasons in summary.get("top_quality_filter_reasons_by_strategy", {}).items():
         for item in reasons[:2]:
             reason_table.add_row(f"filter:{strategy_name}", item["reason"], str(item["count"]))

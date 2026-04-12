@@ -151,6 +151,7 @@ Important replay detail:
 - replay regime classification uses the replay bars directly
 - it does not re-fetch a separate market stream for classification
 - `candidate-only` replay evaluates deterministic candidates without invoking the graph
+- `deterministic-only` replay converts deterministic candidates into fully specified rule-based actions without invoking the graph
 - `full-llm` replay follows the same routed single-strategy path as live
 - `candidate-only` replay can compare all strategies allowed by the active regime unless `--strategy` is set
 
@@ -158,6 +159,7 @@ Replay metrics currently include:
 
 - signal count
 - simulated trades vs no-trade
+- deterministic action generation count
 - regime grouping
 - strategy grouping
 - passive forward behavior by regime, even for bars with no trade
@@ -178,12 +180,14 @@ Replay modes:
 
 - `regime-only`: classify regimes only
 - `candidate-only`: evaluate deterministic candidates without invoking the LLM graph
+- `deterministic-only`: build and evaluate fully deterministic actions from strategy rules only
 - `full-llm`: run the same routed strategy flow as live, including the graph
 
 Replay diagnostics are meant to answer three different questions:
 
 - `regime-only`: how often is the market being classified into each regime?
 - `candidate-only`: how often does each deterministic strategy actually find a setup?
+- `deterministic-only`: what happens if the bot trades the strategy rules directly with no LLM screening?
 - `full-llm`: how does the full bot behave after deterministic routing and gating?
 
 ### How To Read Replay Output
@@ -193,6 +197,7 @@ The replay CLI currently prints several tables. They should be interpreted as fo
 - `Bot Replay Summary`
   - high-level run metadata and counts
   - `Simulated trades` means a setup existed and the replay fill model would have filled it
+  - `Deterministic actions` means the replay action builder produced a complete executable rule-based trade
   - `No trade` means either no setup existed, the mode intentionally stayed flat, or a candidate never filled
 - `By Regime`
   - how many evaluated bars fell into each regime
@@ -209,6 +214,7 @@ The replay CLI currently prints several tables. They should be interpreted as fo
   - fastest way to diagnose why signals are missing
   - `regime:*` rows explain why bars landed in a regime bucket
   - `candidate:*` rows explain why a strategy did not produce a candidate
+  - `deterministic:*` rows explain why a candidate did not become a complete deterministic trade action
   - `filter:*` rows explain why a structured decision was flattened after candidate approval
 
 Practical guidance:
@@ -216,6 +222,42 @@ Practical guidance:
 - If `range_fade` counts are low, first inspect `By Regime` and `Top Skip Reasons` before changing range-fade rules.
 - If `low_quality` is large, use `Regime Behavior` before loosening thresholds. Do not force more `range` labels without evidence.
 - If `candidate-only` looks promising but `full-llm` degrades, the issue is likely prompt or post-parse behavior rather than regime classification.
+- If `deterministic-only` matches or beats `full-llm`, the LLM is not currently earning its place in the entry path.
+
+## Deterministic Replay Rules
+
+The deterministic replay baseline is intentionally simple. It is meant to benchmark the LLM path, not replace live trading yet.
+
+### trend_pullback deterministic spec
+
+- entry: candidate zone midpoint via `LIMIT_ZONE`
+- stop: candidate invalidation level
+- target: fixed `R` multiple from entry
+- expiry: strategy-specific configurable bar count
+
+Current defaults:
+
+- `bot_deterministic_trend_pullback_target_r_multiple = 2.0`
+- `bot_deterministic_trend_pullback_expiry_bars = 5`
+
+### range_fade deterministic spec
+
+- entry: candidate edge zone midpoint via `LIMIT_ZONE`
+- stop: candidate invalidation level outside the range
+- target: candidate reference target by default, with fixed-`R` fallback available
+- expiry: shorter than trend pullback by default
+
+Current defaults:
+
+- `bot_deterministic_range_fade_target_mode = "reference"`
+- `bot_deterministic_range_fade_target_r_multiple = 2.0`
+- `bot_deterministic_range_fade_expiry_bars = 3`
+
+Purpose of these rules:
+
+- create a stable, explicit replay baseline
+- make strategy comparison fast and reproducible
+- measure whether the LLM layer improves actual outcomes enough to justify its cost and variance
 
 ## State and Diagnostics
 
@@ -299,6 +341,7 @@ Key bot-specific defaults:
 - regime thresholds for spread/slope/volatility
 - `bot_pullback_atr_tolerance`
 - range-fade thresholds for edge proximity, width sanity, stop buffer, and target buffer
+- deterministic replay target/expiry settings per strategy
 - per-timeframe max entry distance
 
 If changing strategy behavior, check config defaults before changing prompt text.
@@ -413,6 +456,20 @@ python cli/main.py bot-replay \
   --end "2026-04-11 23:00" \
   --data-source hyperliquid \
   --mode full-llm \
+  --testnet
+```
+
+Deterministic replay baseline:
+
+```bash
+python cli/main.py bot-replay \
+  --symbol BTC-USD \
+  --timeframe 1h \
+  --start "2026-03-01 00:00" \
+  --end "2026-04-11 23:00" \
+  --data-source hyperliquid \
+  --analysis-interval-minutes 60 \
+  --mode deterministic-only \
   --testnet
 ```
 

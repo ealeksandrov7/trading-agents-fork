@@ -993,8 +993,8 @@ class BotRunner:
         strategy_filter: Optional[str] = None,
     ) -> dict[str, Any]:
         replay_mode = mode.strip().lower()
-        if replay_mode not in {"regime-only", "candidate-only", "full-llm"}:
-            raise ValueError("replay mode must be one of: regime-only, candidate-only, full-llm")
+        if replay_mode not in {"regime-only", "candidate-only", "deterministic-only", "full-llm"}:
+            raise ValueError("replay mode must be one of: regime-only, candidate-only, deterministic-only, full-llm")
         bars = self._load_replay_bars(
             self.bot_config.symbol,
             start_timestamp,
@@ -1040,10 +1040,12 @@ class BotRunner:
                         quality_filter_reasons=[],
                         tool_errors=[],
                         llm_evaluated=False,
+                        deterministic_action_generated=False,
+                        deterministic_action_reason="Deterministic action builder not used in regime-only replay.",
                     )
                 )
                 continue
-            elif replay_mode == "candidate-only":
+            elif replay_mode in {"candidate-only", "deterministic-only"}:
                 regime = self._replay_regime(state.symbol, ts.strftime("%Y-%m-%d %H:%M"), bars)
                 strategies = [
                     strategy
@@ -1068,16 +1070,18 @@ class BotRunner:
                                 target_reference=None,
                                 reward_risk_estimate=None,
                                 reclaim_confirmed=False,
-                                reason="No strategy is eligible for this regime in candidate-only replay.",
+                                reason=f"No strategy is eligible for this regime in {replay_mode} replay.",
                             ),
                             self._build_replay_flat_action(
                                 state.symbol,
                                 ts.strftime("%Y-%m-%d %H:%M"),
-                                "Candidate-only replay mode found no eligible strategy for this bar.",
+                                f"{replay_mode} replay mode found no eligible strategy for this bar.",
                             ),
                             quality_filter_reasons=[],
                             tool_errors=[],
                             llm_evaluated=False,
+                            deterministic_action_generated=False,
+                            deterministic_action_reason="No strategy is eligible for this regime.",
                         )
                     )
                     continue
@@ -1092,27 +1096,36 @@ class BotRunner:
                     action = self._build_replay_flat_action(
                         state.symbol,
                         ts.strftime("%Y-%m-%d %H:%M"),
-                        "Candidate-only replay mode does not invoke LLM evaluation.",
+                        f"{replay_mode} replay mode does not invoke LLM evaluation.",
                     )
+                    deterministic_action_generated = False
+                    deterministic_action_reason = "Deterministic action builder was not used."
                     if candidate.candidate_setup_present:
-                        action = {
-                            "symbol": state.symbol,
-                            "timestamp": ts.strftime("%Y-%m-%d %H:%M"),
-                            "action": candidate.direction,
-                            "entry_mode": "LIMIT_ZONE",
-                            "entry_price": None,
-                            "entry_zone_low": candidate.entry_zone_low,
-                            "entry_zone_high": candidate.entry_zone_high,
-                            "confidence": 0.5,
-                            "thesis_summary": candidate.reason,
-                            "time_horizon": self.bot_config.timeframe,
-                            "stop_loss": candidate.invalidation_level,
-                            "take_profit": candidate.target_reference,
-                            "invalidation": candidate.reason,
-                            "size_hint": "small",
-                            "setup_expiry_bars": self.bot_config.setup_expiry_bars_default,
-                            "position_instruction": "OPEN",
-                        }
+                        if replay_mode == "candidate-only":
+                            action = {
+                                "symbol": state.symbol,
+                                "timestamp": ts.strftime("%Y-%m-%d %H:%M"),
+                                "action": candidate.direction,
+                                "entry_mode": "LIMIT_ZONE",
+                                "entry_price": None,
+                                "entry_zone_low": candidate.entry_zone_low,
+                                "entry_zone_high": candidate.entry_zone_high,
+                                "confidence": 0.5,
+                                "thesis_summary": candidate.reason,
+                                "time_horizon": self.bot_config.timeframe,
+                                "stop_loss": candidate.invalidation_level,
+                                "take_profit": candidate.target_reference,
+                                "invalidation": candidate.reason,
+                                "size_hint": "small",
+                                "setup_expiry_bars": self.bot_config.setup_expiry_bars_default,
+                                "position_instruction": "OPEN",
+                            }
+                        else:
+                            action, deterministic_action_generated, deterministic_action_reason = self._build_deterministic_replay_action(
+                                state.symbol,
+                                ts.strftime("%Y-%m-%d %H:%M"),
+                                candidate,
+                            )
                     observations.append(
                         self._build_replay_observation(
                             bars,
@@ -1125,6 +1138,8 @@ class BotRunner:
                             quality_filter_reasons=[],
                             tool_errors=[],
                             llm_evaluated=False,
+                            deterministic_action_generated=deterministic_action_generated,
+                            deterministic_action_reason=deterministic_action_reason,
                         )
                     )
                 continue
@@ -1159,6 +1174,8 @@ class BotRunner:
                             quality_filter_reasons=[],
                             tool_errors=[],
                             llm_evaluated=False,
+                            deterministic_action_generated=False,
+                            deterministic_action_reason="Bar skipped because routed strategy did not match replay strategy filter.",
                         )
                     )
                     continue
@@ -1184,6 +1201,8 @@ class BotRunner:
                             analysis["diagnostics"]["candidate"]["candidate_setup_present"]
                             and analysis["diagnostics"]["regime"]["trade_allowed"]
                         ),
+                        deterministic_action_generated=False,
+                        deterministic_action_reason="Deterministic action builder not used in full-llm replay.",
                     )
                 )
         return {
@@ -1287,6 +1306,131 @@ class BotRunner:
             "position_instruction": "NO_ACTION",
         }
 
+    def _build_deterministic_replay_action(
+        self,
+        symbol: str,
+        timestamp: str,
+        candidate: CandidateSnapshot,
+    ) -> tuple[dict[str, Any], bool, str]:
+        if not candidate.candidate_setup_present:
+            return (
+                self._build_replay_flat_action(symbol, timestamp, candidate.reason),
+                False,
+                candidate.reason,
+            )
+
+        if candidate.entry_zone_low is None or candidate.entry_zone_high is None or candidate.invalidation_level is None:
+            reason = "Candidate is missing deterministic entry zone or invalidation."
+            return self._build_replay_flat_action(symbol, timestamp, reason), False, reason
+
+        entry_zone_low = float(candidate.entry_zone_low)
+        entry_zone_high = float(candidate.entry_zone_high)
+        entry_mid = (entry_zone_low + entry_zone_high) / 2.0
+        stop_loss = float(candidate.invalidation_level)
+        side = str(candidate.direction).upper()
+        if side not in {TradeAction.LONG.value, TradeAction.SHORT.value}:
+            reason = f"Unsupported deterministic action direction: {candidate.direction}"
+            return self._build_replay_flat_action(symbol, timestamp, reason), False, reason
+
+        if candidate.setup_family == "range_fade":
+            return self._build_range_fade_deterministic_action(
+                symbol,
+                timestamp,
+                candidate,
+                entry_mid,
+                stop_loss,
+                side,
+            )
+        return self._build_trend_pullback_deterministic_action(
+            symbol,
+            timestamp,
+            candidate,
+            entry_mid,
+            stop_loss,
+            side,
+        )
+
+    def _build_trend_pullback_deterministic_action(
+        self,
+        symbol: str,
+        timestamp: str,
+        candidate: CandidateSnapshot,
+        entry_mid: float,
+        stop_loss: float,
+        side: str,
+    ) -> tuple[dict[str, Any], bool, str]:
+        risk = entry_mid - stop_loss if side == TradeAction.LONG.value else stop_loss - entry_mid
+        if risk <= 0:
+            reason = "Trend pullback deterministic risk is non-positive."
+            return self._build_replay_flat_action(symbol, timestamp, reason), False, reason
+        r_multiple = float(self.config.get("bot_deterministic_trend_pullback_target_r_multiple", 2.0))
+        take_profit = entry_mid + risk * r_multiple if side == TradeAction.LONG.value else entry_mid - risk * r_multiple
+        expiry = int(self.config.get("bot_deterministic_trend_pullback_expiry_bars", 5))
+        action = {
+            "symbol": symbol,
+            "timestamp": timestamp,
+            "action": side,
+            "entry_mode": "LIMIT_ZONE",
+            "entry_price": None,
+            "entry_zone_low": candidate.entry_zone_low,
+            "entry_zone_high": candidate.entry_zone_high,
+            "confidence": 0.55,
+            "thesis_summary": "Deterministic trend_pullback replay action from candidate baseline rules.",
+            "time_horizon": self.bot_config.timeframe,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "invalidation": candidate.reason,
+            "size_hint": "small",
+            "setup_expiry_bars": expiry,
+            "position_instruction": "OPEN",
+        }
+        return action, True, "Deterministic trend_pullback action built successfully."
+
+    def _build_range_fade_deterministic_action(
+        self,
+        symbol: str,
+        timestamp: str,
+        candidate: CandidateSnapshot,
+        entry_mid: float,
+        stop_loss: float,
+        side: str,
+    ) -> tuple[dict[str, Any], bool, str]:
+        risk = entry_mid - stop_loss if side == TradeAction.LONG.value else stop_loss - entry_mid
+        if risk <= 0:
+            reason = "Range fade deterministic risk is non-positive."
+            return self._build_replay_flat_action(symbol, timestamp, reason), False, reason
+        target_mode = str(self.config.get("bot_deterministic_range_fade_target_mode", "reference")).lower()
+        take_profit = None
+        if target_mode == "reference" and candidate.target_reference is not None:
+            take_profit = float(candidate.target_reference)
+        else:
+            r_multiple = float(self.config.get("bot_deterministic_range_fade_target_r_multiple", 2.0))
+            take_profit = entry_mid + risk * r_multiple if side == TradeAction.LONG.value else entry_mid - risk * r_multiple
+        reward = take_profit - entry_mid if side == TradeAction.LONG.value else entry_mid - take_profit
+        if reward <= 0:
+            reason = "Range fade deterministic reward is non-positive."
+            return self._build_replay_flat_action(symbol, timestamp, reason), False, reason
+        expiry = int(self.config.get("bot_deterministic_range_fade_expiry_bars", 3))
+        action = {
+            "symbol": symbol,
+            "timestamp": timestamp,
+            "action": side,
+            "entry_mode": "LIMIT_ZONE",
+            "entry_price": None,
+            "entry_zone_low": candidate.entry_zone_low,
+            "entry_zone_high": candidate.entry_zone_high,
+            "confidence": 0.55,
+            "thesis_summary": f"Deterministic range_fade replay action using {target_mode} target rules.",
+            "time_horizon": self.bot_config.timeframe,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "invalidation": candidate.reason,
+            "size_hint": "small",
+            "setup_expiry_bars": expiry,
+            "position_instruction": "OPEN",
+        }
+        return action, True, "Deterministic range_fade action built successfully."
+
     def _replay_regime(
         self,
         symbol: str,
@@ -1311,6 +1455,8 @@ class BotRunner:
         quality_filter_reasons: list[str],
         tool_errors: list[str],
         llm_evaluated: bool,
+        deterministic_action_generated: bool,
+        deterministic_action_reason: str,
     ) -> dict[str, Any]:
         observation = {
             "decision_timestamp": timestamp.isoformat(),
@@ -1329,6 +1475,8 @@ class BotRunner:
             "raw_action": action,
             "final_action": action,
             "llm_evaluated": llm_evaluated,
+            "deterministic_action_generated": deterministic_action_generated,
+            "deterministic_action_reason": deterministic_action_reason,
         }
         observation.update(
             evaluate_replay_observation(
