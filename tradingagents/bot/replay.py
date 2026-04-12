@@ -39,6 +39,16 @@ def evaluate_replay_observation(
         "r_2": None,
         "r_4": None,
         "r_8": None,
+        "forward_return_1_pct": _forward_close_return(frame, current_idx, 1),
+        "forward_return_2_pct": _forward_close_return(frame, current_idx, 2),
+        "forward_return_4_pct": _forward_close_return(frame, current_idx, 4),
+        "forward_return_8_pct": _forward_close_return(frame, current_idx, 8),
+        "forward_abs_return_1_pct": _forward_abs_close_return(frame, current_idx, 1),
+        "forward_abs_return_2_pct": _forward_abs_close_return(frame, current_idx, 2),
+        "forward_abs_return_4_pct": _forward_abs_close_return(frame, current_idx, 4),
+        "forward_abs_return_8_pct": _forward_abs_close_return(frame, current_idx, 8),
+        "forward_range_4_pct": _forward_realized_range(frame, current_idx, 4),
+        "forward_range_8_pct": _forward_realized_range(frame, current_idx, 8),
     }
 
     if not action or str(action.get("action", "")).upper() == TradeAction.FLAT.value:
@@ -74,6 +84,7 @@ def summarize_replay(observations: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "top_regime_reasons": {},
         "top_candidate_reasons_by_strategy": {},
         "top_quality_filter_reasons_by_strategy": {},
+        "regime_behavior": {},
     }
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     by_strategy: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -97,6 +108,16 @@ def summarize_replay(observations: Iterable[dict[str, Any]]) -> dict[str, Any]:
             "avg_r_8": _average_metric(executed, "r_8"),
             "avg_mfe_r": _average_metric(executed, "mfe_r"),
             "avg_mae_r": _average_metric(executed, "mae_r"),
+        }
+        summary["regime_behavior"][regime] = {
+            "total": len(items),
+            "avg_forward_return_1_pct": _average_metric(items, "forward_return_1_pct"),
+            "avg_forward_return_4_pct": _average_metric(items, "forward_return_4_pct"),
+            "avg_forward_return_8_pct": _average_metric(items, "forward_return_8_pct"),
+            "avg_forward_abs_return_4_pct": _average_metric(items, "forward_abs_return_4_pct"),
+            "avg_forward_abs_return_8_pct": _average_metric(items, "forward_abs_return_8_pct"),
+            "avg_forward_range_4_pct": _average_metric(items, "forward_range_4_pct"),
+            "avg_forward_range_8_pct": _average_metric(items, "forward_range_8_pct"),
         }
         skipped = [item for item in items if not item.get("executed")]
         summary["top_regime_reasons"][regime] = _top_reasons(skipped, "regime_reason")
@@ -209,6 +230,39 @@ def _average_metric(items: list[dict[str, Any]], key: str) -> Optional[float]:
     if not values:
         return None
     return sum(values) / len(values)
+
+
+def _forward_close_return(frame: pd.DataFrame, current_idx: int, horizon: int) -> Optional[float]:
+    idx = current_idx + horizon
+    if idx >= len(frame):
+        return None
+    current_close = float(frame.iloc[current_idx]["Close"])
+    if current_close <= 0:
+        return None
+    future_close = float(frame.iloc[idx]["Close"])
+    return (future_close - current_close) / current_close
+
+
+def _forward_abs_close_return(frame: pd.DataFrame, current_idx: int, horizon: int) -> Optional[float]:
+    value = _forward_close_return(frame, current_idx, horizon)
+    if value is None:
+        return None
+    return abs(value)
+
+
+def _forward_realized_range(frame: pd.DataFrame, current_idx: int, horizon: int) -> Optional[float]:
+    end_idx = current_idx + horizon
+    if end_idx >= len(frame):
+        return None
+    current_close = float(frame.iloc[current_idx]["Close"])
+    if current_close <= 0:
+        return None
+    future = frame.iloc[current_idx + 1 : end_idx + 1]
+    if future.empty:
+        return None
+    highest = float(future["High"].max())
+    lowest = float(future["Low"].min())
+    return (highest - lowest) / current_close
 
 
 def _top_reasons(items: list[dict[str, Any]], key: str, *, limit: int = 3) -> list[dict[str, Any]]:

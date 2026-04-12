@@ -133,7 +133,7 @@ Replay is also handled by [tradingagents/bot/runner.py](/Users/evlogialeksandrov
 
 Use:
 
-- `BotRunner.run_replay(start, end, data_source=...)`
+- `BotRunner.run_replay(start, end, data_source=..., mode=..., strategy_filter=...)`
 
 CLI command:
 
@@ -150,6 +150,9 @@ Important replay detail:
 
 - replay regime classification uses the replay bars directly
 - it does not re-fetch a separate market stream for classification
+- `candidate-only` replay evaluates deterministic candidates without invoking the graph
+- `full-llm` replay follows the same routed single-strategy path as live
+- `candidate-only` replay can compare all strategies allowed by the active regime unless `--strategy` is set
 
 Replay metrics currently include:
 
@@ -157,16 +160,62 @@ Replay metrics currently include:
 - simulated trades vs no-trade
 - regime grouping
 - strategy grouping
+- passive forward behavior by regime, even for bars with no trade
 - top skip reasons by regime
 - top candidate and filter rejection reasons by strategy
 - `R_1`, `R_2`, `R_4`, `R_8`
 - `MAE` / `MFE`
+
+Current replay summary sections:
+
+- overall run summary
+- `By Regime`
+- `Regime Behavior`
+- `By Strategy`
+- `Top Skip Reasons`
 
 Replay modes:
 
 - `regime-only`: classify regimes only
 - `candidate-only`: evaluate deterministic candidates without invoking the LLM graph
 - `full-llm`: run the same routed strategy flow as live, including the graph
+
+Replay diagnostics are meant to answer three different questions:
+
+- `regime-only`: how often is the market being classified into each regime?
+- `candidate-only`: how often does each deterministic strategy actually find a setup?
+- `full-llm`: how does the full bot behave after deterministic routing and gating?
+
+### How To Read Replay Output
+
+The replay CLI currently prints several tables. They should be interpreted as follows:
+
+- `Bot Replay Summary`
+  - high-level run metadata and counts
+  - `Simulated trades` means a setup existed and the replay fill model would have filled it
+  - `No trade` means either no setup existed, the mode intentionally stayed flat, or a candidate never filled
+- `By Regime`
+  - how many evaluated bars fell into each regime
+  - in deterministic modes, this helps separate classification frequency from actual trade frequency
+- `Regime Behavior`
+  - passive forward behavior of all bars in that regime, even if the bot stayed flat
+  - use this to study whether `low_quality`, `range`, or trend labels behave differently after classification
+  - `Avg Fwd4 %` / `Avg Fwd8 %` show directional drift
+  - `Avg Abs4 %` and `Avg Range8 %` show movement magnitude regardless of direction
+- `By Strategy`
+  - how many opportunities were evaluated for each strategy family
+  - in `candidate-only`, this is the main table for comparing deterministic signal frequency and simulated performance
+- `Top Skip Reasons`
+  - fastest way to diagnose why signals are missing
+  - `regime:*` rows explain why bars landed in a regime bucket
+  - `candidate:*` rows explain why a strategy did not produce a candidate
+  - `filter:*` rows explain why a structured decision was flattened after candidate approval
+
+Practical guidance:
+
+- If `range_fade` counts are low, first inspect `By Regime` and `Top Skip Reasons` before changing range-fade rules.
+- If `low_quality` is large, use `Regime Behavior` before loosening thresholds. Do not force more `range` labels without evidence.
+- If `candidate-only` looks promising but `full-llm` degrades, the issue is likely prompt or post-parse behavior rather than regime classification.
 
 ## State and Diagnostics
 
@@ -181,6 +230,13 @@ Relevant persisted fields:
 - `candidate_snapshot`
 - `last_decision_diagnostics`
 - exchange/order/position state
+
+Runtime graph state now also carries:
+
+- `allowed_setup_families`
+- routed `setup_family`
+- regime summary/context
+- candidate summary/context
 
 Current event log types now include deterministic gate outputs such as:
 
@@ -225,6 +281,11 @@ Each row currently stores:
 
 The journal is currently written for live bot cycles. Replay still returns in-memory evaluation results and does not yet persist rows into the SQLite journal.
 
+The journal schema is migration-safe for the current additions:
+
+- `allowed_setup_families`
+- `selected_setup_family`
+
 ## Config Defaults That Matter
 
 Defined in [tradingagents/default_config.py](/Users/evlogialeksandrov/repos/TradingAgents/tradingagents/default_config.py).
@@ -241,6 +302,13 @@ Key bot-specific defaults:
 - per-timeframe max entry distance
 
 If changing strategy behavior, check config defaults before changing prompt text.
+
+Current practical interpretation of the regime taxonomy:
+
+- `trend_up` / `trend_down`: tradable trend conditions
+- `range`: explicitly bounded mean-reversion conditions
+- `high_volatility_event`: hard no-trade due to event-style instability
+- `low_quality`: ambiguous or transitional structure; intentionally not forced into range or trend
 
 ## Known Current Constraints
 
@@ -345,6 +413,34 @@ python cli/main.py bot-replay \
   --end "2026-04-11 23:00" \
   --data-source hyperliquid \
   --mode full-llm \
+  --testnet
+```
+
+Replay only one strategy:
+
+```bash
+python cli/main.py bot-replay \
+  --symbol BTC-USD \
+  --timeframe 1h \
+  --start "2026-03-01 00:00" \
+  --end "2026-04-11 23:00" \
+  --data-source hyperliquid \
+  --mode candidate-only \
+  --strategy range_fade \
+  --testnet
+```
+
+Research-oriented replay for dense regime sampling:
+
+```bash
+python cli/main.py bot-replay \
+  --symbol BTC-USD \
+  --timeframe 1h \
+  --start "2026-03-01 00:00" \
+  --end "2026-04-11 23:00" \
+  --data-source hyperliquid \
+  --analysis-interval-minutes 60 \
+  --mode candidate-only \
   --testnet
 ```
 

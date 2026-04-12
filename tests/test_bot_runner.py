@@ -1086,6 +1086,45 @@ class BotRunnerPlannerTests(unittest.TestCase):
             "planned entry is outside the allowed range_fade zone",
         )
 
+    def test_replay_summary_includes_regime_behavior_metrics(self):
+        bars = pd.DataFrame(
+            [
+                {"Date": pd.Timestamp("2026-04-01 00:00", tz="UTC"), "Open": 100, "High": 101, "Low": 99, "Close": 100, "Volume": 1},
+                {"Date": pd.Timestamp("2026-04-01 01:00", tz="UTC"), "Open": 100, "High": 103, "Low": 100, "Close": 102, "Volume": 1},
+                {"Date": pd.Timestamp("2026-04-01 02:00", tz="UTC"), "Open": 102, "High": 104, "Low": 101, "Close": 103, "Volume": 1},
+                {"Date": pd.Timestamp("2026-04-01 03:00", tz="UTC"), "Open": 103, "High": 105, "Low": 102, "Close": 104, "Volume": 1},
+                {"Date": pd.Timestamp("2026-04-01 04:00", tz="UTC"), "Open": 104, "High": 106, "Low": 103, "Close": 105, "Volume": 1},
+                {"Date": pd.Timestamp("2026-04-01 05:00", tz="UTC"), "Open": 105, "High": 106, "Low": 104, "Close": 105, "Volume": 1},
+                {"Date": pd.Timestamp("2026-04-01 06:00", tz="UTC"), "Open": 105, "High": 107, "Low": 104, "Close": 106, "Volume": 1},
+                {"Date": pd.Timestamp("2026-04-01 07:00", tz="UTC"), "Open": 106, "High": 108, "Low": 105, "Close": 107, "Volume": 1},
+                {"Date": pd.Timestamp("2026-04-01 08:00", tz="UTC"), "Open": 107, "High": 109, "Low": 106, "Close": 108, "Volume": 1},
+            ]
+        )
+
+        from tradingagents.bot.replay import evaluate_replay_observation, summarize_replay
+
+        observation = {
+            "regime_label": "trend_up",
+            "regime_reason": "Uptrend confirmed.",
+            "setup_family": "none",
+            "candidate_reason": "No strategy is eligible.",
+            "quality_filter_reasons": [],
+            "executed": False,
+            "llm_evaluated": False,
+        }
+        observation.update(
+            evaluate_replay_observation(
+                bars,
+                "2026-04-01T00:00:00+00:00",
+                {"action": "FLAT"},
+                setup_expiry_bars_default=3,
+            )
+        )
+        summary = summarize_replay([observation])
+        self.assertIn("trend_up", summary["regime_behavior"])
+        self.assertAlmostEqual(summary["regime_behavior"]["trend_up"]["avg_forward_return_4_pct"], 0.05)
+        self.assertGreater(summary["regime_behavior"]["trend_up"]["avg_forward_range_8_pct"], 0.0)
+
     def test_quality_filter_rejects_range_fade_entry_outside_zone(self):
         snapshot = ExchangeStateSnapshot(
             wallet_address="0xabc",

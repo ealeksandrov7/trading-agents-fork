@@ -1589,6 +1589,24 @@ def bot_replay(
         )
     console.print(regime_table)
 
+    behavior_table = Table(title="Regime Behavior", box=box.SIMPLE)
+    behavior_table.add_column("Regime")
+    behavior_table.add_column("Total", justify="right")
+    behavior_table.add_column("Avg Fwd4 %", justify="right")
+    behavior_table.add_column("Avg Fwd8 %", justify="right")
+    behavior_table.add_column("Avg Abs4 %", justify="right")
+    behavior_table.add_column("Avg Range8 %", justify="right")
+    for regime, stats in result["summary"].get("regime_behavior", {}).items():
+        behavior_table.add_row(
+            regime,
+            str(stats["total"]),
+            "-" if stats["avg_forward_return_4_pct"] is None else f"{stats['avg_forward_return_4_pct'] * 100:.2f}",
+            "-" if stats["avg_forward_return_8_pct"] is None else f"{stats['avg_forward_return_8_pct'] * 100:.2f}",
+            "-" if stats["avg_forward_abs_return_4_pct"] is None else f"{stats['avg_forward_abs_return_4_pct'] * 100:.2f}",
+            "-" if stats["avg_forward_range_8_pct"] is None else f"{stats['avg_forward_range_8_pct'] * 100:.2f}",
+        )
+    console.print(behavior_table)
+
     strategy_table = Table(title="By Strategy", box=box.SIMPLE)
     strategy_table.add_column("Strategy")
     strategy_table.add_column("Total", justify="right")
