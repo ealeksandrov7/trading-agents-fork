@@ -21,6 +21,11 @@ def create_portfolio_manager(llm, memory):
         trader_plan = state["investment_plan"]
         exchange_state_summary = state.get("exchange_state_summary", "")
         bot_state_summary = state.get("bot_state_summary", "")
+        regime_summary = state.get("regime_summary", "")
+        regime_context = state.get("regime_context", {}) or {}
+        candidate_summary = state.get("candidate_summary", "")
+        candidate_context = state.get("candidate_context", {}) or {}
+        setup_family = state.get("setup_family", "trend_pullback")
 
         curr_situation = f"{market_research_report}\n\n{sentiment_report}\n\n{news_report}\n\n{fundamentals_report}"
         past_memories = memory.get_memories(curr_situation, n_matches=2)
@@ -69,6 +74,10 @@ Your highest priority is format compliance. You must output the `STRUCTURED_DECI
 - Lessons from past decisions: **{lessons}**
 - Trade date: **{state["trade_date"]}**
 - Required time horizon for the structured output: **{analysis_timeframe}**
+- Approved setup family: **{setup_family}**
+- Deterministic regime gate: **{regime_summary or 'No regime summary provided.'}**
+- Preferred directional bias from regime gate: **{regime_context.get("preferred_action", "FLAT")}**
+- Deterministic candidate gate: **{candidate_summary or 'No candidate summary provided.'}**
 - Current exchange/account state: **{exchange_state_summary or 'No exchange state provided.'}**
 - Current bot state: **{bot_state_summary or 'No bot state provided.'}**
 
@@ -109,6 +118,9 @@ Rules for the JSON:
 - Use `position_instruction` to explicitly describe how the bot should handle existing positions or pending orders.
 - Use `setup_expiry_bars` for directional setups that wait on a trigger; omit or null for `NO_ACTION`, `HOLD`, or immediate `MARKET` entries.
 - If the correct stance is defensive or capital-preservation only, use `FLAT` instead of prose like "stay in cash" or "maintain liquidity."
+- If the regime gate says `trade_allowed=False`, you must output `action=FLAT` and `position_instruction=NO_ACTION`.
+- If the candidate gate says `candidate_setup_present=False`, you must output `action=FLAT` and `position_instruction=NO_ACTION`.
+- If the regime gate says `trade_allowed=True`, only approve the configured `{setup_family}` in the `preferred_action` direction. Do not invent alternate setups.
 
 ---
 

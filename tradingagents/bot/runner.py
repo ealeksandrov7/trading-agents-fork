@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import json
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
+
+import pandas as pd
 
 from langchain_core.messages import ToolMessage
 
 from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.dataflows.stockstats_utils import load_ohlcv
 from tradingagents.execution import (
     ExchangeStateSnapshot,
     ExecutionMode,
@@ -23,6 +27,10 @@ from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.agents.utils.core_stock_tools import TOOL_ERROR_PREFIX
 
 from .models import BotActionPlan, BotConfig, BotState
+from .candidate import CandidateSnapshot, detect_trend_pullback_candidate
+from .journal import BotJournal
+from .regime import RegimeSnapshot, classify_regime, classify_regime_from_data
+from .replay import evaluate_replay_observation, summarize_replay
 from .state import BotStateStore
 
 
@@ -41,6 +49,7 @@ class BotRunner:
         self.config["decision_timeframe"] = bot_config.timeframe
         self.config["hyperliquid_testnet"] = bot_config.testnet
         self.store = BotStateStore(Path(self.config["bot_state_path"]))
+        self.journal = BotJournal(Path(self.config["bot_journal_path"]))
         self.exchange = executor or HyperliquidExecutor(
             wallet_address=self.config.get("hyperliquid_wallet_address"),
             private_key=self.config.get("hyperliquid_private_key"),
@@ -100,8 +109,41 @@ class BotRunner:
             return
 
         self._emit(f"[bot] running full analysis for {decision_timestamp} UTC")
-        final_state = self._run_decision(state, snapshot, decision_timestamp)
-        tool_errors = self._extract_tool_errors(final_state)
+        analysis = self._analyze_decision(state, snapshot, decision_timestamp)
+        final_state = analysis["final_state"]
+        tool_errors = analysis["tool_errors"]
+        action = analysis["action"]
+        diagnostics = analysis["diagnostics"]
+        analysis_timestamp = datetime.now(timezone.utc).isoformat()
+        state.regime_snapshot = diagnostics["regime"]
+        state.candidate_snapshot = diagnostics["candidate"]
+        state.last_decision_diagnostics = diagnostics
+        events = self.store.append_event(
+            state,
+            events,
+            event_type="regime",
+            message=diagnostics["regime"]["reason"],
+            payload=diagnostics["regime"],
+        )
+        events = self.store.append_event(
+            state,
+            events,
+            event_type="candidate",
+            message=diagnostics["candidate"]["reason"],
+            payload=diagnostics["candidate"],
+        )
+        if diagnostics["quality_filter_reasons"]:
+            events = self.store.append_event(
+                state,
+                events,
+                event_type="decision_rejected",
+                message="Structured decision rejected by deterministic quality filters.",
+                payload={
+                    "reasons": diagnostics["quality_filter_reasons"],
+                    "raw_action": diagnostics["raw_action"],
+                    "final_action": diagnostics["final_action"],
+                },
+            )
         if tool_errors:
             for tool_error in tool_errors:
                 self._emit(f"[bot] tool failure: {tool_error}")
@@ -114,7 +156,6 @@ class BotRunner:
             )
         else:
             self._emit("[bot] analysis completed cleanly")
-        action = final_state.get("final_trade_action") or {}
         if not action:
             events = self.store.append_event(
                 state,
@@ -125,6 +166,18 @@ class BotRunner:
             self._emit(f"[bot] structured decision invalid: {final_state.get('final_trade_action_error', 'missing structured decision')}")
             state.last_decision_timestamp = decision_timestamp
             state.last_decision_action = {}
+            self._journal_cycle(
+                state,
+                snapshot,
+                decision_timestamp,
+                analysis_timestamp,
+                diagnostics,
+                {},
+                None,
+                tool_errors,
+                "decision_error",
+                final_state.get("final_trade_action_error", "missing structured decision"),
+            )
             self.store.save(state, events)
             return
 
@@ -152,6 +205,18 @@ class BotRunner:
             )
             state.last_decision_timestamp = decision_timestamp
             state.last_decision_action = action
+            self._journal_cycle(
+                state,
+                snapshot,
+                decision_timestamp,
+                analysis_timestamp,
+                diagnostics,
+                action,
+                plan,
+                tool_errors,
+                "entry_blocked_tool_failure",
+                "Live entry blocked because required analysis tools failed.",
+            )
             self.store.save(state, events)
             return
 
@@ -159,6 +224,18 @@ class BotRunner:
             self._emit(f"[bot] no action: {plan.reason}")
             state.last_decision_timestamp = decision_timestamp
             state.last_decision_action = action
+            self._journal_cycle(
+                state,
+                snapshot,
+                decision_timestamp,
+                analysis_timestamp,
+                diagnostics,
+                action,
+                plan,
+                tool_errors,
+                "no_action",
+                plan.reason,
+            )
             self.store.save(state, events)
             return
 
@@ -171,6 +248,18 @@ class BotRunner:
             state.active_order_created_at = None
             state.last_decision_timestamp = decision_timestamp
             state.last_decision_action = action
+            self._journal_cycle(
+                state,
+                snapshot,
+                decision_timestamp,
+                analysis_timestamp,
+                diagnostics,
+                action,
+                plan,
+                tool_errors,
+                "cancel_pending",
+                plan.reason,
+            )
             self.store.save(state, events)
             return
 
@@ -181,7 +270,23 @@ class BotRunner:
                 mode=ExecutionMode.LIVE,
                 open_position=self._position_from_state(state),
             )
-            preview = self.exchange.execute(close_intent)
+            try:
+                preview = self.exchange.execute(close_intent)
+            except Exception as exc:
+                self._journal_cycle(
+                    state,
+                    snapshot,
+                    decision_timestamp,
+                    analysis_timestamp,
+                    diagnostics,
+                    action,
+                    plan,
+                    tool_errors,
+                    "close_error",
+                    str(exc),
+                    order_intent=close_intent.model_dump(),
+                )
+                raise
             if preview.status == "rejected":
                 self._emit(f"[bot] close rejected for {close_intent.symbol}: {preview.message}")
                 events = self.store.append_event(
@@ -190,6 +295,20 @@ class BotRunner:
                     event_type="close_rejected",
                     message=preview.message,
                     payload=preview.model_dump(),
+                )
+                self._journal_cycle(
+                    state,
+                    snapshot,
+                    decision_timestamp,
+                    analysis_timestamp,
+                    diagnostics,
+                    action,
+                    plan,
+                    tool_errors,
+                    "close_rejected",
+                    preview.message,
+                    order_intent=close_intent.model_dump(),
+                    order_preview=preview.model_dump(),
                 )
                 self.store.save(state, events)
                 return
@@ -209,6 +328,20 @@ class BotRunner:
             )
             state.last_decision_timestamp = decision_timestamp
             state.last_decision_action = action
+            self._journal_cycle(
+                state,
+                snapshot,
+                decision_timestamp,
+                analysis_timestamp,
+                diagnostics,
+                action,
+                plan,
+                tool_errors,
+                "close_submitted",
+                preview.message,
+                order_intent=close_intent.model_dump(),
+                order_preview=preview.model_dump(),
+            )
             self.store.save(state, events)
             return
 
@@ -216,10 +349,38 @@ class BotRunner:
         if intent is None:
             state.last_decision_timestamp = decision_timestamp
             state.last_decision_action = action
+            self._journal_cycle(
+                state,
+                snapshot,
+                decision_timestamp,
+                analysis_timestamp,
+                diagnostics,
+                action,
+                plan,
+                tool_errors,
+                "missing_intent",
+                "Plan returned no executable order intent.",
+            )
             self.store.save(state, events)
             return
 
-        preview = self.exchange.execute(intent)
+        try:
+            preview = self.exchange.execute(intent)
+        except Exception as exc:
+            self._journal_cycle(
+                state,
+                snapshot,
+                decision_timestamp,
+                analysis_timestamp,
+                diagnostics,
+                action,
+                plan,
+                tool_errors,
+                "entry_error",
+                str(exc),
+                order_intent=intent.model_dump(),
+            )
+            raise
         if preview.status == "rejected":
             self._emit(f"[bot] entry rejected for {intent.symbol}: {preview.message}")
             events = self.store.append_event(
@@ -231,6 +392,20 @@ class BotRunner:
             )
             state.last_decision_timestamp = decision_timestamp
             state.last_decision_action = action
+            self._journal_cycle(
+                state,
+                snapshot,
+                decision_timestamp,
+                analysis_timestamp,
+                diagnostics,
+                action,
+                plan,
+                tool_errors,
+                "entry_rejected",
+                preview.message,
+                order_intent=intent.model_dump(),
+                order_preview=preview.model_dump(),
+            )
             self.store.save(state, events)
             return
         self._emit(
@@ -253,6 +428,20 @@ class BotRunner:
         )
         state.last_decision_timestamp = decision_timestamp
         state.last_decision_action = action
+        self._journal_cycle(
+            state,
+            snapshot,
+            decision_timestamp,
+            analysis_timestamp,
+            diagnostics,
+            action,
+            plan,
+            tool_errors,
+            "entry_submitted",
+            preview.message,
+            order_intent=intent.model_dump(),
+            order_preview=preview.model_dump(),
+        )
         self.store.save(state, events)
 
     def run_forever(self) -> None:
@@ -291,9 +480,90 @@ class BotRunner:
         init_state = graph.propagator.create_initial_state(self.bot_config.symbol, decision_timestamp)
         init_state["exchange_state_summary"] = self._exchange_summary(snapshot)
         init_state["bot_state_summary"] = self._bot_summary(state)
+        regime_snapshot = state.regime_snapshot or {}
+        init_state["regime_summary"] = regime_snapshot.get("summary", "")
+        init_state["regime_context"] = regime_snapshot
+        candidate_snapshot = state.candidate_snapshot or {}
+        init_state["candidate_summary"] = candidate_snapshot.get("summary", "")
+        init_state["candidate_context"] = candidate_snapshot
+        init_state["setup_family"] = regime_snapshot.get(
+            "setup_family",
+            self.config.get("bot_strategy_setup_family", "trend_pullback"),
+        )
         graph_args = graph.propagator.get_graph_args()
         final_state = graph.graph.invoke(init_state, config=graph_args["config"])
         return final_state
+
+    def _analyze_decision(
+        self,
+        state: BotState,
+        snapshot: ExchangeStateSnapshot,
+        decision_timestamp: str,
+        replay_bars: Optional[pd.DataFrame] = None,
+    ) -> dict[str, Any]:
+        if replay_bars is None:
+            regime = self._classify_regime(state.symbol, decision_timestamp)
+        else:
+            try:
+                regime = self._classify_regime(
+                    state.symbol,
+                    decision_timestamp,
+                    replay_bars=replay_bars,
+                )
+            except TypeError:
+                regime = self._classify_regime(state.symbol, decision_timestamp)
+        state.regime_snapshot = {**regime.to_dict(), "summary": regime.summary()}
+        candidate = self._detect_candidate(state.symbol, decision_timestamp, regime, replay_bars=replay_bars)
+        state.candidate_snapshot = {**candidate.to_dict(), "summary": candidate.summary()}
+        self._emit(
+            f"[bot] regime {regime.label} | allowed={regime.trade_allowed} | "
+            f"preferred={regime.preferred_action}"
+        )
+        self._emit(
+            f"[bot] candidate present={candidate.candidate_setup_present} | direction={candidate.direction}"
+        )
+
+        if not regime.trade_allowed:
+            final_state = self._build_blocked_regime_decision(state, decision_timestamp, regime)
+        elif not candidate.candidate_setup_present:
+            final_state = self._build_blocked_candidate_decision(state, decision_timestamp, regime, candidate)
+        else:
+            final_state = self._run_decision(state, snapshot, decision_timestamp)
+
+        tool_errors = self._extract_tool_errors(final_state)
+        raw_action = final_state.get("final_trade_action") or {}
+        if not raw_action:
+            return {
+                "final_state": final_state,
+                "tool_errors": tool_errors,
+                "action": raw_action,
+                "diagnostics": {
+                    "regime": state.regime_snapshot,
+                    "candidate": state.candidate_snapshot,
+                    "raw_action": raw_action,
+                    "quality_filter_reasons": [],
+                    "final_action": raw_action,
+                },
+            }
+
+        normalized_action, quality_filter_reasons = self._apply_quality_filters(
+            raw_action,
+            snapshot,
+            regime,
+        )
+        diagnostics = {
+            "regime": state.regime_snapshot,
+            "candidate": state.candidate_snapshot,
+            "raw_action": raw_action,
+            "quality_filter_reasons": quality_filter_reasons,
+            "final_action": normalized_action,
+        }
+        return {
+            "final_state": final_state,
+            "tool_errors": tool_errors,
+            "action": normalized_action,
+            "diagnostics": diagnostics,
+        }
 
     def _build_action_plan(
         self,
@@ -342,6 +612,232 @@ class BotRunner:
         )
         return BotActionPlan(action="OPEN_ENTRY", reason="Submit new entry from latest hourly decision.", order_intent=intent)
 
+    def _classify_regime(
+        self,
+        symbol: str,
+        decision_timestamp: str,
+        *,
+        replay_bars: Optional[pd.DataFrame] = None,
+    ) -> RegimeSnapshot:
+        try:
+            if replay_bars is not None:
+                frame = replay_bars.copy()
+                frame["Date"] = pd.to_datetime(frame["Date"], utc=True, errors="coerce")
+                cutoff = pd.to_datetime(decision_timestamp, utc=True, errors="coerce")
+                frame = frame[frame["Date"] <= cutoff]
+                return classify_regime_from_data(
+                    frame,
+                    self.config,
+                    timeframe=self.bot_config.timeframe,
+                )
+            vendor_symbol = self.bot_config.symbol
+            return classify_regime(vendor_symbol, decision_timestamp, self.config)
+        except Exception as exc:
+            return RegimeSnapshot(
+                label="low_quality",
+                trade_allowed=False,
+                preferred_action="FLAT",
+                setup_family=str(self.config.get("bot_strategy_setup_family", "trend_pullback")),
+                current_price=0.0,
+                ema20=0.0,
+                ema50=0.0,
+                atr14=0.0,
+                atr_pct=0.0,
+                ema20_slope_pct=0.0,
+                trend_spread_pct=0.0,
+                realized_vol_24h=0.0,
+                bar_change_pct=0.0,
+                pullback_distance_atr=0.0,
+                pullback_zone_low=None,
+                pullback_zone_high=None,
+                reason=f"Regime classification failed: {exc}",
+            )
+
+    def _detect_candidate(
+        self,
+        symbol: str,
+        decision_timestamp: str,
+        regime: RegimeSnapshot,
+        *,
+        replay_bars: Optional[pd.DataFrame] = None,
+    ) -> CandidateSnapshot:
+        try:
+            if replay_bars is not None:
+                frame = replay_bars.copy()
+                frame["Date"] = pd.to_datetime(frame["Date"], utc=True, errors="coerce")
+                cutoff = pd.to_datetime(decision_timestamp, utc=True, errors="coerce")
+                frame = frame[frame["Date"] <= cutoff]
+            else:
+                frame = load_ohlcv(self.bot_config.symbol, decision_timestamp, timeframe_override=self.bot_config.timeframe)
+            return detect_trend_pullback_candidate(frame, regime, self.config)
+        except Exception as exc:
+            return CandidateSnapshot(
+                candidate_setup_present=False,
+                setup_family=str(self.config.get("bot_strategy_setup_family", "trend_pullback")),
+                direction=regime.preferred_action,
+                entry_zone_low=regime.pullback_zone_low,
+                entry_zone_high=regime.pullback_zone_high,
+                invalidation_level=None,
+                target_reference=None,
+                reward_risk_estimate=None,
+                reclaim_confirmed=False,
+                reason=f"Candidate detection failed: {exc}",
+            )
+
+    def _build_blocked_regime_decision(
+        self,
+        state: BotState,
+        decision_timestamp: str,
+        regime: RegimeSnapshot,
+    ) -> dict[str, Any]:
+        reason = regime.reason
+        payload = {
+            "symbol": state.symbol,
+            "timestamp": decision_timestamp,
+            "action": "FLAT",
+            "entry_mode": "MARKET",
+            "entry_price": None,
+            "entry_zone_low": None,
+            "entry_zone_high": None,
+            "confidence": 0.0,
+            "thesis_summary": reason,
+            "time_horizon": self.bot_config.timeframe,
+            "stop_loss": None,
+            "take_profit": None,
+            "invalidation": reason,
+            "size_hint": "small",
+            "setup_expiry_bars": None,
+            "position_instruction": "NO_ACTION",
+        }
+        return {
+            "messages": [],
+            "market_report": f"No-trade regime: {regime.summary()}",
+            "final_trade_decision": (
+                "STRUCTURED_DECISION\n```json\n"
+                f"{json.dumps(payload, indent=2)}\n```\n"
+                f"EXECUTIVE_SUMMARY\nStand aside. {reason}"
+            ),
+            "final_trade_action": payload,
+            "final_trade_action_error": "",
+        }
+
+    def _build_blocked_candidate_decision(
+        self,
+        state: BotState,
+        decision_timestamp: str,
+        regime: RegimeSnapshot,
+        candidate: CandidateSnapshot,
+    ) -> dict[str, Any]:
+        reason = candidate.reason
+        payload = {
+            "symbol": state.symbol,
+            "timestamp": decision_timestamp,
+            "action": "FLAT",
+            "entry_mode": "MARKET",
+            "entry_price": None,
+            "entry_zone_low": None,
+            "entry_zone_high": None,
+            "confidence": 0.0,
+            "thesis_summary": reason,
+            "time_horizon": self.bot_config.timeframe,
+            "stop_loss": None,
+            "take_profit": None,
+            "invalidation": reason,
+            "size_hint": "small",
+            "setup_expiry_bars": None,
+            "position_instruction": "NO_ACTION",
+        }
+        return {
+            "messages": [],
+            "market_report": (
+                f"Eligible regime but no deterministic {regime.setup_family} candidate. "
+                f"{candidate.summary()}"
+            ),
+            "final_trade_decision": (
+                "STRUCTURED_DECISION\n```json\n"
+                f"{json.dumps(payload, indent=2)}\n```\n"
+                f"EXECUTIVE_SUMMARY\nStand aside. {reason}"
+            ),
+            "final_trade_action": payload,
+            "final_trade_action_error": "",
+        }
+
+    def _apply_quality_filters(
+        self,
+        action: dict[str, Any],
+        snapshot: ExchangeStateSnapshot,
+        regime: RegimeSnapshot,
+    ) -> tuple[dict[str, Any], list[str]]:
+        reasons: list[str] = []
+        action_side = str(action.get("action", "")).upper()
+        if action_side == TradeAction.FLAT.value:
+            return action, []
+
+        if str(action.get("symbol", "")).upper() != self._market_symbol(snapshot).upper():
+            reasons.append("structured decision symbol does not match active market snapshot")
+
+        if not regime.trade_allowed:
+            reasons.append(f"regime {regime.label} is blocked for new entries")
+        elif action_side != regime.preferred_action:
+            reasons.append(
+                f"direction {action_side} conflicts with regime preferred action {regime.preferred_action}"
+            )
+
+        planned_entry = self._planned_entry_price(action, snapshot)
+        if planned_entry is None:
+            reasons.append("unable to infer entry price for quality validation")
+        else:
+            if not self._entry_in_pullback_zone(planned_entry, regime):
+                reasons.append("planned entry is outside the allowed pullback zone")
+            distance_limit = self._entry_distance_limit_for_timeframe(self.bot_config.timeframe)
+            mark_price = snapshot.mark_prices.get(self._market_symbol(snapshot), 0.0)
+            if distance_limit is not None and mark_price > 0:
+                entry_distance_pct = abs(planned_entry - mark_price) / mark_price
+                if entry_distance_pct > distance_limit:
+                    reasons.append(
+                        f"planned entry distance {entry_distance_pct:.4f} exceeds limit {distance_limit:.4f}"
+                    )
+            if not self._entry_orientation_is_pullback(action, planned_entry, mark_price):
+                reasons.append("entry orientation does not behave like a trend pullback")
+
+        reward_risk = self._reward_risk_ratio(action, planned_entry)
+        if reward_risk is None:
+            reasons.append("reward-to-risk could not be computed")
+        elif reward_risk < float(self.config.get("bot_min_reward_risk", 1.8)):
+            reasons.append(
+                f"reward-to-risk {reward_risk:.2f} is below minimum {self.config.get('bot_min_reward_risk', 1.8):.2f}"
+            )
+
+        if reasons:
+            return self._build_rejected_action(action, regime, reasons), reasons
+        return action, reasons
+
+    def _build_rejected_action(
+        self,
+        action: dict[str, Any],
+        regime: RegimeSnapshot,
+        reasons: list[str],
+    ) -> dict[str, Any]:
+        reason_text = "; ".join(reasons)
+        return {
+            "symbol": action.get("symbol", self.bot_config.symbol.replace("-USD", "")),
+            "timestamp": action.get("timestamp", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")),
+            "action": "FLAT",
+            "entry_mode": "MARKET",
+            "entry_price": None,
+            "entry_zone_low": None,
+            "entry_zone_high": None,
+            "confidence": 0.0,
+            "thesis_summary": f"Rejected {regime.setup_family}: {reason_text}",
+            "time_horizon": action.get("time_horizon", self.bot_config.timeframe),
+            "stop_loss": None,
+            "take_profit": None,
+            "invalidation": reason_text,
+            "size_hint": action.get("size_hint", "small"),
+            "setup_expiry_bars": None,
+            "position_instruction": "NO_ACTION",
+        }
+
     def _reconcile_local_order_state(
         self,
         state: BotState,
@@ -376,6 +872,7 @@ class BotRunner:
             f"Analysis interval: {state.analysis_interval_minutes}m | "
             f"Active order id: {state.active_order_id or 'none'} | "
             f"Position: {state.current_position or 'none'} | "
+            f"Regime: {(state.regime_snapshot or {}).get('label', 'unknown')} | "
             f"Failures: {state.consecutive_failures}"
         )
 
@@ -439,6 +936,321 @@ class BotRunner:
             or 0.0
         )
 
+    def run_replay(
+        self,
+        start_timestamp: str,
+        end_timestamp: str,
+        *,
+        data_source: str = "vendor",
+        mode: str = "full-llm",
+    ) -> dict[str, Any]:
+        replay_mode = mode.strip().lower()
+        if replay_mode not in {"regime-only", "candidate-only", "full-llm"}:
+            raise ValueError("replay mode must be one of: regime-only, candidate-only, full-llm")
+        bars = self._load_replay_bars(
+            self.bot_config.symbol,
+            start_timestamp,
+            end_timestamp,
+            data_source=data_source,
+        )
+        timestamps = self._replay_analysis_timestamps(bars, start_timestamp, end_timestamp)
+        observations: list[dict[str, Any]] = []
+        for ts in timestamps:
+            state = BotState(
+                symbol=self.bot_config.symbol.replace("-USD", ""),
+                timeframe=self.bot_config.timeframe,
+                signal_interval_minutes=self.bot_config.signal_interval_minutes,
+                analysis_interval_minutes=self.bot_config.analysis_interval_minutes,
+            )
+            snapshot = self._historical_snapshot_for_timestamp(bars, ts)
+            if replay_mode == "regime-only":
+                regime = self._classify_regime(
+                    state.symbol,
+                    ts.strftime("%Y-%m-%d %H:%M"),
+                    replay_bars=bars,
+                )
+                candidate = CandidateSnapshot(
+                    candidate_setup_present=False,
+                    setup_family=self.config.get("bot_strategy_setup_family", "trend_pullback"),
+                    direction=regime.preferred_action,
+                    entry_zone_low=regime.pullback_zone_low,
+                    entry_zone_high=regime.pullback_zone_high,
+                    invalidation_level=None,
+                    target_reference=None,
+                    reward_risk_estimate=None,
+                    reclaim_confirmed=False,
+                    reason="Regime-only replay skipped deterministic candidate detection.",
+                )
+                analysis = {
+                    "tool_errors": [],
+                    "final_state": {},
+                    "action": {},
+                    "diagnostics": {
+                        "regime": {**regime.to_dict(), "summary": regime.summary()},
+                        "candidate": {**candidate.to_dict(), "summary": candidate.summary()},
+                        "raw_action": {},
+                        "quality_filter_reasons": [],
+                        "final_action": {},
+                    },
+                }
+            elif replay_mode == "candidate-only":
+                regime = self._classify_regime(
+                    state.symbol,
+                    ts.strftime("%Y-%m-%d %H:%M"),
+                    replay_bars=bars,
+                )
+                candidate = self._detect_candidate(
+                    state.symbol,
+                    ts.strftime("%Y-%m-%d %H:%M"),
+                    regime,
+                    replay_bars=bars,
+                )
+                analysis = {
+                    "tool_errors": [],
+                    "final_state": {},
+                    "action": {},
+                    "diagnostics": {
+                        "regime": {**regime.to_dict(), "summary": regime.summary()},
+                        "candidate": {**candidate.to_dict(), "summary": candidate.summary()},
+                        "raw_action": {},
+                        "quality_filter_reasons": [],
+                        "final_action": {},
+                    },
+                }
+            else:
+                analysis = self._analyze_decision(
+                    state,
+                    snapshot,
+                    ts.strftime("%Y-%m-%d %H:%M"),
+                    replay_bars=bars,
+                )
+            action = analysis["action"]
+            if replay_mode == "regime-only":
+                action = self._build_replay_flat_action(
+                    state.symbol,
+                    ts.strftime("%Y-%m-%d %H:%M"),
+                    "Regime-only replay mode does not invoke candidate or LLM evaluation.",
+                )
+            elif replay_mode == "candidate-only":
+                action = self._build_replay_flat_action(
+                    state.symbol,
+                    ts.strftime("%Y-%m-%d %H:%M"),
+                    "Candidate-only replay mode does not invoke LLM evaluation.",
+                )
+                if analysis["diagnostics"]["candidate"]["candidate_setup_present"]:
+                    action = {
+                        "symbol": state.symbol,
+                        "timestamp": ts.strftime("%Y-%m-%d %H:%M"),
+                        "action": analysis["diagnostics"]["candidate"]["direction"],
+                        "entry_mode": "LIMIT_ZONE",
+                        "entry_price": None,
+                        "entry_zone_low": analysis["diagnostics"]["candidate"]["entry_zone_low"],
+                        "entry_zone_high": analysis["diagnostics"]["candidate"]["entry_zone_high"],
+                        "confidence": 0.5,
+                        "thesis_summary": analysis["diagnostics"]["candidate"]["reason"],
+                        "time_horizon": self.bot_config.timeframe,
+                        "stop_loss": analysis["diagnostics"]["candidate"]["invalidation_level"],
+                        "take_profit": analysis["diagnostics"]["candidate"]["target_reference"],
+                        "invalidation": analysis["diagnostics"]["candidate"]["reason"],
+                        "size_hint": "small",
+                        "setup_expiry_bars": self.bot_config.setup_expiry_bars_default,
+                        "position_instruction": "OPEN",
+                    }
+            observation = {
+                "decision_timestamp": ts.isoformat(),
+                "symbol": state.symbol,
+                "timeframe": self.bot_config.timeframe,
+                "replay_mode": replay_mode,
+                "setup_family": self.config.get("bot_strategy_setup_family", "trend_pullback"),
+                "regime_label": analysis["diagnostics"]["regime"]["label"],
+                "regime_trade_allowed": analysis["diagnostics"]["regime"]["trade_allowed"],
+                "candidate_setup_present": analysis["diagnostics"]["candidate"]["candidate_setup_present"],
+                "quality_filter_reasons": analysis["diagnostics"]["quality_filter_reasons"],
+                "tool_errors": analysis["tool_errors"],
+                "raw_action": analysis["diagnostics"]["raw_action"],
+                "final_action": action,
+                "llm_evaluated": replay_mode == "full-llm"
+                and analysis["diagnostics"]["candidate"]["candidate_setup_present"]
+                and analysis["diagnostics"]["regime"]["trade_allowed"],
+            }
+            observation.update(
+                evaluate_replay_observation(
+                    bars,
+                    ts.isoformat(),
+                    action,
+                    setup_expiry_bars_default=self.bot_config.setup_expiry_bars_default,
+                )
+            )
+            observations.append(observation)
+        return {
+            "symbol": self.bot_config.symbol,
+            "timeframe": self.bot_config.timeframe,
+            "start_timestamp": start_timestamp,
+            "end_timestamp": end_timestamp,
+            "data_source": data_source,
+            "mode": replay_mode,
+            "observations": observations,
+            "summary": summarize_replay(observations),
+        }
+
+    def _load_replay_bars(
+        self,
+        symbol: str,
+        start_timestamp: str,
+        end_timestamp: str,
+        *,
+        data_source: str = "vendor",
+    ) -> pd.DataFrame:
+        timeframe = self.bot_config.timeframe.lower()
+        if data_source == "hyperliquid":
+            hl_symbol = symbol.replace("-USD", "")
+            if not hasattr(self.exchange, "get_historical_ohlcv"):
+                raise ValueError("hyperliquid replay requires an executor with get_historical_ohlcv")
+            return self.exchange.get_historical_ohlcv(
+                hl_symbol,
+                start_time=start_timestamp,
+                end_time=end_timestamp,
+                timeframe=timeframe,
+            )
+        return load_ohlcv(symbol, end_timestamp, timeframe_override=timeframe)
+
+    def _replay_analysis_timestamps(
+        self,
+        bars: pd.DataFrame,
+        start_timestamp: str,
+        end_timestamp: str,
+    ) -> list[pd.Timestamp]:
+        frame = bars.sort_values("Date").copy()
+        frame["Date"] = pd.to_datetime(frame["Date"], utc=True, errors="coerce")
+        start_ts = pd.to_datetime(start_timestamp, utc=True)
+        end_ts = pd.to_datetime(end_timestamp, utc=True)
+        timestamps: list[pd.Timestamp] = []
+        for ts in frame["Date"]:
+            if pd.isna(ts) or ts < start_ts or ts > end_ts:
+                continue
+            minutes_since_midnight = ts.hour * 60 + ts.minute
+            if minutes_since_midnight % self.bot_config.analysis_interval_minutes == 0:
+                timestamps.append(ts)
+        return timestamps
+
+    def _historical_snapshot_for_timestamp(
+        self,
+        bars: pd.DataFrame,
+        timestamp: pd.Timestamp,
+    ) -> ExchangeStateSnapshot:
+        frame = bars.copy()
+        frame["Date"] = pd.to_datetime(frame["Date"], utc=True, errors="coerce")
+        matching = frame[frame["Date"] == timestamp]
+        if matching.empty:
+            raise ValueError(f"historical snapshot timestamp not found: {timestamp}")
+        bar = matching.iloc[-1]
+        symbol = self.bot_config.symbol.replace("-USD", "")
+        bankroll = float(self.config.get("bot_replay_initial_equity", 1000.0))
+        return ExchangeStateSnapshot(
+            wallet_address="replay",
+            equity=bankroll,
+            available_balance=bankroll,
+            spot_usdc_balance=bankroll,
+            mark_prices={symbol: float(bar["Close"])},
+            positions=[],
+            open_orders=[],
+            fetched_at=timestamp.isoformat(),
+        )
+
+    def _build_replay_flat_action(
+        self,
+        symbol: str,
+        timestamp: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        return {
+            "symbol": symbol,
+            "timestamp": timestamp,
+            "action": "FLAT",
+            "entry_mode": "MARKET",
+            "entry_price": None,
+            "entry_zone_low": None,
+            "entry_zone_high": None,
+            "confidence": 0.0,
+            "thesis_summary": reason,
+            "time_horizon": self.bot_config.timeframe,
+            "stop_loss": None,
+            "take_profit": None,
+            "invalidation": reason,
+            "size_hint": "small",
+            "setup_expiry_bars": None,
+            "position_instruction": "NO_ACTION",
+        }
+
+    def _market_symbol(self, snapshot: ExchangeStateSnapshot) -> str:
+        if snapshot.mark_prices:
+            return next(iter(snapshot.mark_prices.keys()))
+        return self.bot_config.symbol.replace("-USD", "")
+
+    def _planned_entry_price(
+        self,
+        action: dict[str, Any],
+        snapshot: ExchangeStateSnapshot,
+    ) -> Optional[float]:
+        entry_mode = str(action.get("entry_mode") or "MARKET").upper()
+        if entry_mode == "MARKET":
+            mark_symbol = self._market_symbol(snapshot)
+            return float(snapshot.mark_prices.get(mark_symbol, 0.0) or 0.0)
+        if entry_mode == "LIMIT":
+            price = action.get("entry_price")
+            return float(price) if price is not None else None
+        low = action.get("entry_zone_low")
+        high = action.get("entry_zone_high")
+        if low is None or high is None:
+            return None
+        return (float(low) + float(high)) / 2.0
+
+    def _reward_risk_ratio(
+        self,
+        action: dict[str, Any],
+        planned_entry: Optional[float],
+    ) -> Optional[float]:
+        if planned_entry is None:
+            return None
+        stop_loss = action.get("stop_loss")
+        take_profit = action.get("take_profit")
+        if stop_loss is None or take_profit is None:
+            return None
+        stop_loss = float(stop_loss)
+        take_profit = float(take_profit)
+        side = str(action.get("action", "")).upper()
+        if side == TradeAction.LONG.value:
+            risk = planned_entry - stop_loss
+            reward = take_profit - planned_entry
+        else:
+            risk = stop_loss - planned_entry
+            reward = planned_entry - take_profit
+        if risk <= 0 or reward <= 0:
+            return None
+        return reward / risk
+
+    def _entry_in_pullback_zone(self, planned_entry: float, regime: RegimeSnapshot) -> bool:
+        if regime.pullback_zone_low is None or regime.pullback_zone_high is None:
+            return False
+        return regime.pullback_zone_low <= planned_entry <= regime.pullback_zone_high
+
+    def _entry_orientation_is_pullback(
+        self,
+        action: dict[str, Any],
+        planned_entry: float,
+        mark_price: float,
+    ) -> bool:
+        side = str(action.get("action", "")).upper()
+        entry_mode = str(action.get("entry_mode") or "MARKET").upper()
+        tolerance = mark_price * 0.002
+        if entry_mode == "MARKET":
+            return True
+        if side == TradeAction.LONG.value:
+            return planned_entry <= mark_price + tolerance
+        if side == TradeAction.SHORT.value:
+            return planned_entry >= mark_price - tolerance
+        return False
+
     def _extract_tool_errors(self, final_state: dict) -> list[str]:
         messages = final_state.get("messages") or []
         errors: list[str] = []
@@ -464,6 +1276,42 @@ class BotRunner:
                 seen.add(error)
                 deduped.append(error)
         return deduped
+
+    def _journal_cycle(
+        self,
+        state: BotState,
+        snapshot: ExchangeStateSnapshot,
+        decision_timestamp: str,
+        analysis_timestamp: str,
+        diagnostics: dict[str, Any],
+        action: dict[str, Any],
+        plan: Optional[BotActionPlan],
+        tool_errors: list[str],
+        outcome: str,
+        outcome_message: str,
+        *,
+        order_intent: Optional[dict[str, Any]] = None,
+        order_preview: Optional[dict[str, Any]] = None,
+    ) -> None:
+        self.journal.insert_cycle(
+            mode="live",
+            symbol=state.symbol,
+            timeframe=state.timeframe,
+            decision_timestamp=decision_timestamp,
+            analysis_timestamp=analysis_timestamp,
+            regime_snapshot=diagnostics.get("regime"),
+            candidate_snapshot=diagnostics.get("candidate"),
+            raw_action=diagnostics.get("raw_action"),
+            final_action=action or diagnostics.get("final_action"),
+            quality_filter_reasons=diagnostics.get("quality_filter_reasons"),
+            tool_errors=tool_errors,
+            plan_action=plan.action if plan else None,
+            outcome=outcome,
+            outcome_message=outcome_message,
+            exchange_snapshot=snapshot.model_dump(),
+            order_intent=order_intent,
+            order_preview=order_preview,
+        )
 
 
 def build_bot_runtime_config() -> dict:

@@ -16,6 +16,11 @@ def create_market_analyst(llm):
         current_date = state["trade_date"]
         instrument_context = build_instrument_context(state["company_of_interest"])
         analysis_timeframe = get_config().get("analysis_timeframe", "1d")
+        regime_summary = state.get("regime_summary", "")
+        setup_family = state.get("setup_family", "trend_pullback")
+        regime_context = state.get("regime_context", {}) or {}
+        candidate_summary = state.get("candidate_summary", "")
+        candidate_context = state.get("candidate_context", {}) or {}
         intraday_instruction = ""
         if analysis_timeframe in {"4h", "1h"}:
             intraday_instruction = (
@@ -31,8 +36,29 @@ def create_market_analyst(llm):
             get_indicators,
         ]
 
+        trade_allowed = bool(regime_context.get("trade_allowed"))
+        preferred_action = regime_context.get("preferred_action", "FLAT")
         system_message = (
-            """You are a trading assistant tasked with analyzing financial markets. Your role is to select the **most relevant indicators** for a given market condition or trading strategy from the following list. The goal is to choose up to **8 indicators** that provide complementary insights without redundancy. Categories and each category's indicators are:
+            f"""You are a trading assistant tasked with analyzing financial markets for an autonomous Hyperliquid bot. Your role is to validate one approved setup family instead of brainstorming multiple trade ideas.
+
+Approved setup family: **{setup_family}**
+Deterministic regime gate:
+- {regime_summary or 'No regime summary provided.'}
+- The regime payload says trade_allowed={str(trade_allowed).lower()} and preferred_action={preferred_action}.
+- Deterministic setup candidate:
+- {candidate_summary or 'No candidate summary provided.'}
+- The candidate payload says candidate_setup_present={str(bool(candidate_context.get("candidate_setup_present"))).lower()} and direction={candidate_context.get("direction", preferred_action)}.
+- If trade_allowed is false, do not manufacture a trade. State clearly that this bar is a no-trade regime.
+- If candidate_setup_present is false, do not manufacture a trade. Explain why the pullback candidate failed and preserve a no-trade stance.
+- If trade_allowed is true, evaluate only whether the approved setup is present in the preferred direction. Do not propose range fades, breakout chases, or countertrend reversals.
+- Your report must explicitly answer:
+  1. Is a valid {setup_family} setup present? yes/no
+  2. What is the directional bias?
+  3. What exact entry level or zone is justified?
+  4. What invalidation proves the idea wrong?
+  5. If no trade, why should the bot stand aside?
+
+Indicator toolbox reference. Select the **most relevant indicators** for validating the active setup and market condition from the following list. Choose up to **8 indicators** that provide complementary insights without redundancy. Categories and each category's indicators are:
 
 Moving Averages:
 - close_50_sma: 50 SMA: A medium-term trend indicator. Usage: Identify trend direction and serve as dynamic support/resistance. Tips: It lags price; combine with faster indicators for timely signals.
@@ -56,8 +82,7 @@ Volatility Indicators:
 Volume-Based Indicators:
 - vwma: VWMA: A moving average weighted by volume. Usage: Confirm trends by integrating price action with volume data. Tips: Watch for skewed results from volume spikes; use in combination with other volume analyses.
 
-- Select indicators that provide diverse and complementary information. Avoid redundancy (e.g., do not select both rsi and stochrsi). Also briefly explain why they are suitable for the given market context. The configured analysis timeframe for this run is **{analysis_timeframe}** and you should interpret the retrieved OHLCV and indicators on that timeframe. {intraday_instruction} When you tool call, please use the exact name of the indicators provided above as they are defined parameters, otherwise your call will fail. Please make sure to call get_stock_data first to retrieve the CSV that is needed to generate indicators. Then use get_indicators with the specific indicator names. Do not request unnecessarily long raw OHLCV ranges for intraday runs. Write a very detailed and nuanced report of the trends you observe. Provide specific, actionable insights with supporting evidence to help traders make informed decisions."""
-            + """ Make sure to append a Markdown table at the end of the report to organize key points in the report, organized and easy to read."""
+- Select indicators that provide diverse and complementary information. Avoid redundancy (e.g., do not select both rsi and stochrsi). Also briefly explain why they are suitable for the given market context. The configured analysis timeframe for this run is **{analysis_timeframe}** and you should interpret the retrieved OHLCV and indicators on that timeframe. {intraday_instruction} When you tool call, please use the exact name of the indicators provided above as they are defined parameters, otherwise your call will fail. Please make sure to call get_stock_data first to retrieve the CSV that is needed to generate indicators. Then use get_indicators with the specific indicator names. Do not request unnecessarily long raw OHLCV ranges for intraday runs. Write a detailed report focused on whether the approved setup is valid right now. Make sure to append a Markdown table at the end of the report to organize key points in the report, organized and easy to read."""
             + get_language_instruction()
         )
 
@@ -84,7 +109,6 @@ Volume-Based Indicators:
         prompt = prompt.partial(instrument_context=instrument_context)
         prompt = prompt.partial(analysis_timeframe=analysis_timeframe)
         prompt = prompt.partial(intraday_instruction=intraday_instruction)
-
         chain = prompt | llm.bind_tools(tools)
 
         result = chain.invoke(state["messages"])

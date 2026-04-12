@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
 from typing import Optional
 
+import pandas as pd
 from eth_account import Account
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
@@ -123,6 +124,45 @@ class HyperliquidExecutor:
                 )
             )
         return orders
+
+    def get_historical_ohlcv(
+        self,
+        symbol: str,
+        *,
+        start_time: str,
+        end_time: str,
+        timeframe: str = "1h",
+    ) -> pd.DataFrame:
+        interval = self._candle_interval_for_timeframe(timeframe)
+        start_ts = pd.Timestamp(start_time, tz="UTC")
+        end_ts = pd.Timestamp(end_time, tz="UTC")
+        raw = self.info.candles_snapshot(
+            symbol.upper(),
+            interval,
+            int(start_ts.timestamp() * 1000),
+            int(end_ts.timestamp() * 1000),
+        )
+        if not isinstance(raw, list):
+            raise HyperliquidExecutionError("unexpected candleSnapshot response shape")
+
+        rows = []
+        for candle in raw:
+            if not isinstance(candle, dict):
+                continue
+            rows.append(
+                {
+                    "Date": pd.to_datetime(candle.get("t"), unit="ms", utc=True),
+                    "Open": float(candle.get("o", 0.0) or 0.0),
+                    "High": float(candle.get("h", 0.0) or 0.0),
+                    "Low": float(candle.get("l", 0.0) or 0.0),
+                    "Close": float(candle.get("c", 0.0) or 0.0),
+                    "Volume": float(candle.get("v", 0.0) or 0.0),
+                }
+            )
+        frame = pd.DataFrame(rows)
+        if frame.empty:
+            return frame
+        return frame.sort_values("Date").reset_index(drop=True)
 
     def cancel_order(self, symbol: str, order_id: str) -> dict:
         if self.exchange is None:
@@ -462,3 +502,13 @@ class HyperliquidExecutor:
                 if amount is not None:
                     return amount
         return None
+
+    def _candle_interval_for_timeframe(self, timeframe: str) -> str:
+        normalized = str(timeframe).lower()
+        if normalized == "1h":
+            return "1h"
+        if normalized == "4h":
+            return "4h"
+        if normalized == "1d":
+            return "1d"
+        raise HyperliquidExecutionError(f"unsupported Hyperliquid replay timeframe: {timeframe}")

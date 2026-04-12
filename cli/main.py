@@ -1510,5 +1510,87 @@ def bot(
     bot_runner.run_forever()
 
 
+@app.command("bot-replay")
+def bot_replay(
+    symbol: str = typer.Option("BTC-USD", "--symbol", help="Instrument to replay."),
+    timeframe: str = typer.Option("1h", "--timeframe", help="Replay timeframe."),
+    start: str = typer.Option(..., "--start", help="Replay start timestamp, e.g. 2026-04-01 00:00."),
+    end: str = typer.Option(..., "--end", help="Replay end timestamp, e.g. 2026-04-30 23:00."),
+    analysis_interval_minutes: int = typer.Option(240, "--analysis-interval-minutes", help="How often to evaluate the full bot decision path."),
+    data_source: str = typer.Option("vendor", "--data-source", help="Historical data source: vendor or hyperliquid."),
+    mode: str = typer.Option("candidate-only", "--mode", help="Replay mode: regime-only, candidate-only, or full-llm."),
+    testnet: bool = typer.Option(True, "--testnet/--mainnet", help="Use Hyperliquid testnet for native candle replay."),
+    output: Optional[Path] = typer.Option(None, "--output", help="Optional path to write replay JSON."),
+):
+    source = data_source.strip().lower()
+    if source not in {"vendor", "hyperliquid"}:
+        raise typer.BadParameter("data_source must be one of: vendor, hyperliquid")
+    replay_mode = mode.strip().lower()
+    if replay_mode not in {"regime-only", "candidate-only", "full-llm"}:
+        raise typer.BadParameter("mode must be one of: regime-only, candidate-only, full-llm")
+
+    config = DEFAULT_CONFIG.copy()
+    config["analysis_timeframe"] = timeframe
+    config["decision_timeframe"] = timeframe
+    config["hyperliquid_testnet"] = testnet
+    config["bot_analysis_interval_minutes"] = analysis_interval_minutes
+    executor = HyperliquidExecutor(
+        wallet_address=config.get("hyperliquid_wallet_address"),
+        private_key=config.get("hyperliquid_private_key"),
+        base_url=config.get("hyperliquid_base_url"),
+        testnet=testnet,
+    )
+    bot_runner = BotRunner(
+        config=config,
+        bot_config=BotConfig(
+            symbol=symbol,
+            timeframe=timeframe,
+            testnet=testnet,
+            once=True,
+            analysis_interval_minutes=config["bot_analysis_interval_minutes"],
+            reconcile_interval_seconds=config["bot_reconcile_interval_seconds"],
+            setup_expiry_bars_default=config["bot_setup_expiry_bars_default"],
+        ),
+        executor=executor,
+        event_sink=console.print,
+    )
+    result = bot_runner.run_replay(start, end, data_source=source, mode=replay_mode)
+
+    summary = result["summary"]
+    table = Table(title=f"Bot Replay Summary: {symbol} {timeframe}", box=box.SIMPLE)
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    table.add_row("Data source", result["data_source"])
+    table.add_row("Mode", result["mode"])
+    table.add_row("Decisions", str(summary["total_decisions"]))
+    table.add_row("LLM evaluated", str(summary["llm_evaluated"]))
+    table.add_row("Executed", str(summary["executed"]))
+    table.add_row("Skipped", str(summary["skipped"]))
+    console.print(table)
+
+    regime_table = Table(title="By Regime", box=box.SIMPLE)
+    regime_table.add_column("Regime")
+    regime_table.add_column("Total", justify="right")
+    regime_table.add_column("Executed", justify="right")
+    regime_table.add_column("Skipped", justify="right")
+    regime_table.add_column("Avg R4", justify="right")
+    regime_table.add_column("Avg R8", justify="right")
+    for regime, stats in result["summary"]["by_regime"].items():
+        regime_table.add_row(
+            regime,
+            str(stats["total"]),
+            str(stats["executed"]),
+            str(stats["skipped"]),
+            "-" if stats["avg_r_4"] is None else f"{stats['avg_r_4']:.2f}",
+            "-" if stats["avg_r_8"] is None else f"{stats['avg_r_8']:.2f}",
+        )
+    console.print(regime_table)
+
+    if output is not None:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(result, indent=2))
+        console.print(f"[green]Replay written to[/green] {output.resolve()}")
+
+
 if __name__ == "__main__":
     main()
