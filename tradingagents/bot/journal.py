@@ -23,6 +23,8 @@ class BotJournal:
         analysis_timestamp: str,
         regime_snapshot: dict[str, Any] | None,
         candidate_snapshot: dict[str, Any] | None,
+        allowed_setup_families: list[str] | None,
+        selected_setup_family: str | None,
         raw_action: dict[str, Any] | None,
         final_action: dict[str, Any] | None,
         quality_filter_reasons: list[str] | None,
@@ -42,6 +44,8 @@ class BotJournal:
             analysis_timestamp,
             (regime_snapshot or {}).get("label"),
             1 if (regime_snapshot or {}).get("trade_allowed") else 0,
+            json.dumps(allowed_setup_families or []),
+            selected_setup_family,
             (candidate_snapshot or {}).get("direction"),
             1 if (candidate_snapshot or {}).get("candidate_setup_present") else 0,
             (final_action or {}).get("action"),
@@ -70,6 +74,8 @@ class BotJournal:
                     analysis_timestamp,
                     regime_label,
                     regime_trade_allowed,
+                    allowed_setup_families,
+                    selected_setup_family,
                     candidate_direction,
                     candidate_setup_present,
                     final_action,
@@ -86,7 +92,7 @@ class BotJournal:
                     order_intent,
                     order_preview,
                     recorded_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 payload,
             )
@@ -105,6 +111,8 @@ class BotJournal:
                     analysis_timestamp TEXT NOT NULL,
                     regime_label TEXT,
                     regime_trade_allowed INTEGER NOT NULL DEFAULT 0,
+                    allowed_setup_families TEXT NOT NULL DEFAULT '[]',
+                    selected_setup_family TEXT,
                     candidate_direction TEXT,
                     candidate_setup_present INTEGER NOT NULL DEFAULT 0,
                     final_action TEXT,
@@ -124,4 +132,16 @@ class BotJournal:
                 )
                 """
             )
+            existing_columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(bot_cycle_journal)").fetchall()
+            }
+            if "allowed_setup_families" not in existing_columns:
+                conn.execute(
+                    "ALTER TABLE bot_cycle_journal ADD COLUMN allowed_setup_families TEXT NOT NULL DEFAULT '[]'"
+                )
+            if "selected_setup_family" not in existing_columns:
+                conn.execute(
+                    "ALTER TABLE bot_cycle_journal ADD COLUMN selected_setup_family TEXT"
+                )
             conn.commit()

@@ -1519,6 +1519,7 @@ def bot_replay(
     analysis_interval_minutes: int = typer.Option(240, "--analysis-interval-minutes", help="How often to evaluate the full bot decision path."),
     data_source: str = typer.Option("vendor", "--data-source", help="Historical data source: vendor or hyperliquid."),
     mode: str = typer.Option("candidate-only", "--mode", help="Replay mode: regime-only, candidate-only, or full-llm."),
+    strategy: Optional[str] = typer.Option(None, "--strategy", help="Optional strategy filter, e.g. trend_pullback or range_fade."),
     testnet: bool = typer.Option(True, "--testnet/--mainnet", help="Use Hyperliquid testnet for native candle replay."),
     output: Optional[Path] = typer.Option(None, "--output", help="Optional path to write replay JSON."),
 ):
@@ -1554,7 +1555,8 @@ def bot_replay(
         executor=executor,
         event_sink=console.print,
     )
-    result = bot_runner.run_replay(start, end, data_source=source, mode=replay_mode)
+    strategy_filter = strategy.strip().lower() if strategy else None
+    result = bot_runner.run_replay(start, end, data_source=source, mode=replay_mode, strategy_filter=strategy_filter)
 
     summary = result["summary"]
     table = Table(title=f"Bot Replay Summary: {symbol} {timeframe}", box=box.SIMPLE)
@@ -1562,10 +1564,11 @@ def bot_replay(
     table.add_column("Value", justify="right")
     table.add_row("Data source", result["data_source"])
     table.add_row("Mode", result["mode"])
+    table.add_row("Strategy filter", result["strategy_filter"] or "all")
     table.add_row("Decisions", str(summary["total_decisions"]))
     table.add_row("LLM evaluated", str(summary["llm_evaluated"]))
-    table.add_row("Executed", str(summary["executed"]))
-    table.add_row("Skipped", str(summary["skipped"]))
+    table.add_row("Simulated trades", str(summary["executed"]))
+    table.add_row("No trade", str(summary["skipped"]))
     console.print(table)
 
     regime_table = Table(title="By Regime", box=box.SIMPLE)
@@ -1585,6 +1588,24 @@ def bot_replay(
             "-" if stats["avg_r_8"] is None else f"{stats['avg_r_8']:.2f}",
         )
     console.print(regime_table)
+
+    strategy_table = Table(title="By Strategy", box=box.SIMPLE)
+    strategy_table.add_column("Strategy")
+    strategy_table.add_column("Total", justify="right")
+    strategy_table.add_column("Executed", justify="right")
+    strategy_table.add_column("Skipped", justify="right")
+    strategy_table.add_column("Avg R4", justify="right")
+    strategy_table.add_column("Avg R8", justify="right")
+    for strategy_name, stats in result["summary"]["by_strategy"].items():
+        strategy_table.add_row(
+            strategy_name,
+            str(stats["total"]),
+            str(stats["executed"]),
+            str(stats["skipped"]),
+            "-" if stats["avg_r_4"] is None else f"{stats['avg_r_4']:.2f}",
+            "-" if stats["avg_r_8"] is None else f"{stats['avg_r_8']:.2f}",
+        )
+    console.print(strategy_table)
 
     if output is not None:
         output.parent.mkdir(parents=True, exist_ok=True)

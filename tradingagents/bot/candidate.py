@@ -37,13 +37,25 @@ class CandidateSnapshot:
         )
 
 
+def detect_candidate(
+    data: pd.DataFrame,
+    regime: RegimeSnapshot,
+    config: dict,
+    setup_family: Optional[str] = None,
+) -> CandidateSnapshot:
+    selected = str(setup_family or regime.setup_family or config.get("bot_strategy_setup_family", "trend_pullback"))
+    if selected == "range_fade":
+        return detect_range_fade_candidate(data, regime, config)
+    return detect_trend_pullback_candidate(data, regime, config)
+
+
 def detect_trend_pullback_candidate(
     data: pd.DataFrame,
     regime: RegimeSnapshot,
     config: dict,
 ) -> CandidateSnapshot:
-    setup_family = str(config.get("bot_strategy_setup_family", "trend_pullback"))
-    if not regime.trade_allowed:
+    setup_family = "trend_pullback"
+    if not regime.trade_allowed or setup_family not in regime.allowed_setup_families:
         return CandidateSnapshot(
             candidate_setup_present=False,
             setup_family=setup_family,
@@ -145,6 +157,166 @@ def detect_trend_pullback_candidate(
         reward_risk_estimate=reward_risk_estimate,
         reclaim_confirmed=reclaim_confirmed,
         reason=reason,
+    )
+
+
+def detect_range_fade_candidate(
+    data: pd.DataFrame,
+    regime: RegimeSnapshot,
+    config: dict,
+) -> CandidateSnapshot:
+    setup_family = "range_fade"
+    if regime.label != "range" or setup_family not in regime.allowed_setup_families:
+        return CandidateSnapshot(
+            candidate_setup_present=False,
+            setup_family=setup_family,
+            direction="FLAT",
+            entry_zone_low=None,
+            entry_zone_high=None,
+            invalidation_level=None,
+            target_reference=None,
+            reward_risk_estimate=None,
+            reclaim_confirmed=False,
+            reason=f"Regime {regime.label} does not route to range_fade.",
+        )
+    if data.empty or len(data) < 55:
+        return CandidateSnapshot(
+            candidate_setup_present=False,
+            setup_family=setup_family,
+            direction="FLAT",
+            entry_zone_low=None,
+            entry_zone_high=None,
+            invalidation_level=None,
+            target_reference=None,
+            reward_risk_estimate=None,
+            reclaim_confirmed=False,
+            reason="Insufficient bars for deterministic range_fade detection.",
+        )
+
+    frame = _build_feature_frame(data)
+    latest = frame.iloc[-1]
+    recent = frame.tail(24)
+    current_price = float(latest["Close"])
+    atr14 = max(float(latest["atr14"]), 1e-9)
+    range_high = float(recent["High"].max())
+    range_low = float(recent["Low"].min())
+    range_width = range_high - range_low
+    if range_width <= 0:
+        return CandidateSnapshot(
+            candidate_setup_present=False,
+            setup_family=setup_family,
+            direction="FLAT",
+            entry_zone_low=None,
+            entry_zone_high=None,
+            invalidation_level=None,
+            target_reference=None,
+            reward_risk_estimate=None,
+            reclaim_confirmed=False,
+            reason="Range width is invalid for range_fade detection.",
+        )
+
+    min_width_atr = float(config.get("bot_range_fade_min_width_atr", 1.5))
+    max_width_atr = float(config.get("bot_range_fade_max_width_atr", 5.5))
+    if range_width / atr14 < min_width_atr or range_width / atr14 > max_width_atr:
+        return CandidateSnapshot(
+            candidate_setup_present=False,
+            setup_family=setup_family,
+            direction="FLAT",
+            entry_zone_low=range_low,
+            entry_zone_high=range_high,
+            invalidation_level=None,
+            target_reference=None,
+            reward_risk_estimate=None,
+            reclaim_confirmed=False,
+            reason="Detected range width is outside the configured ATR bounds.",
+        )
+
+    edge_threshold = float(config.get("bot_range_fade_edge_atr_tolerance", 0.55)) * atr14
+    stop_buffer = float(config.get("bot_range_fade_stop_buffer_atr", 0.2)) * atr14
+    target_buffer = float(config.get("bot_range_fade_target_buffer_atr", 0.35)) * atr14
+    minimum_rr = float(config.get("bot_min_reward_risk", 1.8))
+
+    direction = "FLAT"
+    entry_zone_low = None
+    entry_zone_high = None
+    invalidation_level = None
+    target_reference = None
+    reward_risk_estimate = None
+    reclaim_confirmed = False
+    reason = "Price is not near a range edge."
+
+    prev_close = float(frame.iloc[-2]["Close"])
+    prev_low = float(frame.iloc[-2]["Low"])
+    prev_high = float(frame.iloc[-2]["High"])
+
+    if current_price - range_low <= edge_threshold:
+        direction = "LONG"
+        entry_zone_low = range_low
+        entry_zone_high = min(range_low + edge_threshold, range_high)
+        invalidation_level = range_low - stop_buffer
+        target_reference = range_high - target_buffer
+        reclaim_confirmed = current_price > prev_close and float(latest["Low"]) >= prev_low
+        risk = current_price - invalidation_level
+        reward = target_reference - current_price
+        if reclaim_confirmed:
+            reason = "Range support rejection detected near the lower boundary."
+        else:
+            reason = "Price touched lower range support but rejection confirmation is missing."
+    elif range_high - current_price <= edge_threshold:
+        direction = "SHORT"
+        entry_zone_low = max(range_low, range_high - edge_threshold)
+        entry_zone_high = range_high
+        invalidation_level = range_high + stop_buffer
+        target_reference = range_low + target_buffer
+        reclaim_confirmed = current_price < prev_close and float(latest["High"]) <= prev_high
+        risk = invalidation_level - current_price
+        reward = current_price - target_reference
+        if reclaim_confirmed:
+            reason = "Range resistance rejection detected near the upper boundary."
+        else:
+            reason = "Price touched upper range resistance but rejection confirmation is missing."
+    else:
+        risk = None
+        reward = None
+
+    if risk is not None and risk > 0 and reward is not None and reward > 0:
+        reward_risk_estimate = reward / risk
+
+    if direction == "FLAT":
+        return CandidateSnapshot(
+            candidate_setup_present=False,
+            setup_family=setup_family,
+            direction=direction,
+            entry_zone_low=range_low,
+            entry_zone_high=range_high,
+            invalidation_level=None,
+            target_reference=None,
+            reward_risk_estimate=None,
+            reclaim_confirmed=False,
+            reason=reason,
+        )
+
+    if not reclaim_confirmed:
+        final_reason = reason
+    elif reward_risk_estimate is None or reward_risk_estimate < minimum_rr:
+        final_reason = (
+            f"Range fade candidate exists but estimated reward-to-risk "
+            f"{0.0 if reward_risk_estimate is None else reward_risk_estimate:.2f} is below {minimum_rr:.2f}."
+        )
+    else:
+        final_reason = "Range fade candidate detected with edge rejection and acceptable estimated RR."
+
+    return CandidateSnapshot(
+        candidate_setup_present=bool(reclaim_confirmed and reward_risk_estimate is not None and reward_risk_estimate >= minimum_rr),
+        setup_family=setup_family,
+        direction=direction,
+        entry_zone_low=entry_zone_low,
+        entry_zone_high=entry_zone_high,
+        invalidation_level=invalidation_level,
+        target_reference=target_reference,
+        reward_risk_estimate=reward_risk_estimate,
+        reclaim_confirmed=reclaim_confirmed,
+        reason=final_reason,
     )
 
 

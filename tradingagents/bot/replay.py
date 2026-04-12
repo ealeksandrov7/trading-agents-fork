@@ -70,10 +70,13 @@ def summarize_replay(observations: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "skipped": 0,
         "llm_evaluated": 0,
         "by_regime": {},
+        "by_strategy": {},
     }
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    by_strategy: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for item in obs:
         grouped[str(item.get("regime_label") or "unknown")].append(item)
+        by_strategy[str(item.get("setup_family") or "none")].append(item)
         if item.get("llm_evaluated"):
             summary["llm_evaluated"] += 1
         if item.get("executed"):
@@ -84,6 +87,17 @@ def summarize_replay(observations: Iterable[dict[str, Any]]) -> dict[str, Any]:
     for regime, items in grouped.items():
         executed = [item for item in items if item.get("executed")]
         summary["by_regime"][regime] = {
+            "total": len(items),
+            "executed": len(executed),
+            "skipped": len(items) - len(executed),
+            "avg_r_4": _average_metric(executed, "r_4"),
+            "avg_r_8": _average_metric(executed, "r_8"),
+            "avg_mfe_r": _average_metric(executed, "mfe_r"),
+            "avg_mae_r": _average_metric(executed, "mae_r"),
+        }
+    for strategy, items in by_strategy.items():
+        executed = [item for item in items if item.get("executed")]
+        summary["by_strategy"][strategy] = {
             "total": len(items),
             "executed": len(executed),
             "skipped": len(items) - len(executed),

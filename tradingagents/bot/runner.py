@@ -27,9 +27,14 @@ from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.agents.utils.core_stock_tools import TOOL_ERROR_PREFIX
 
 from .models import BotActionPlan, BotConfig, BotState
-from .candidate import CandidateSnapshot, detect_trend_pullback_candidate
+from .candidate import CandidateSnapshot, detect_candidate
 from .journal import BotJournal
-from .regime import RegimeSnapshot, classify_regime, classify_regime_from_data
+from .regime import (
+    RegimeSnapshot,
+    allowed_strategies_for_regime,
+    classify_regime,
+    classify_regime_from_data,
+)
 from .replay import evaluate_replay_observation, summarize_replay
 from .state import BotStateStore
 
@@ -486,7 +491,8 @@ class BotRunner:
         candidate_snapshot = state.candidate_snapshot or {}
         init_state["candidate_summary"] = candidate_snapshot.get("summary", "")
         init_state["candidate_context"] = candidate_snapshot
-        init_state["setup_family"] = regime_snapshot.get(
+        init_state["allowed_setup_families"] = regime_snapshot.get("allowed_setup_families", [])
+        init_state["setup_family"] = candidate_snapshot.get("setup_family") or regime_snapshot.get(
             "setup_family",
             self.config.get("bot_strategy_setup_family", "trend_pullback"),
         )
@@ -500,6 +506,7 @@ class BotRunner:
         snapshot: ExchangeStateSnapshot,
         decision_timestamp: str,
         replay_bars: Optional[pd.DataFrame] = None,
+        strategy_family: Optional[str] = None,
     ) -> dict[str, Any]:
         if replay_bars is None:
             regime = self._classify_regime(state.symbol, decision_timestamp)
@@ -513,14 +520,21 @@ class BotRunner:
             except TypeError:
                 regime = self._classify_regime(state.symbol, decision_timestamp)
         state.regime_snapshot = {**regime.to_dict(), "summary": regime.summary()}
-        candidate = self._detect_candidate(state.symbol, decision_timestamp, regime, replay_bars=replay_bars)
+        selected_strategy = strategy_family or self._select_strategy_for_regime(regime)
+        candidate = self._candidate_with_fallback(
+            state.symbol,
+            decision_timestamp,
+            regime,
+            setup_family=selected_strategy,
+            replay_bars=replay_bars,
+        )
         state.candidate_snapshot = {**candidate.to_dict(), "summary": candidate.summary()}
         self._emit(
             f"[bot] regime {regime.label} | allowed={regime.trade_allowed} | "
-            f"preferred={regime.preferred_action}"
+            f"preferred={regime.preferred_action} | strategies={','.join(regime.allowed_setup_families) or 'none'}"
         )
         self._emit(
-            f"[bot] candidate present={candidate.candidate_setup_present} | direction={candidate.direction}"
+            f"[bot] candidate present={candidate.candidate_setup_present} | strategy={candidate.setup_family} | direction={candidate.direction}"
         )
 
         if not regime.trade_allowed:
@@ -550,6 +564,7 @@ class BotRunner:
             raw_action,
             snapshot,
             regime,
+            candidate,
         )
         diagnostics = {
             "regime": state.regime_snapshot,
@@ -637,7 +652,8 @@ class BotRunner:
                 label="low_quality",
                 trade_allowed=False,
                 preferred_action="FLAT",
-                setup_family=str(self.config.get("bot_strategy_setup_family", "trend_pullback")),
+                setup_family="",
+                allowed_setup_families=[],
                 current_price=0.0,
                 ema20=0.0,
                 ema50=0.0,
@@ -659,6 +675,7 @@ class BotRunner:
         decision_timestamp: str,
         regime: RegimeSnapshot,
         *,
+        setup_family: Optional[str] = None,
         replay_bars: Optional[pd.DataFrame] = None,
     ) -> CandidateSnapshot:
         try:
@@ -669,11 +686,11 @@ class BotRunner:
                 frame = frame[frame["Date"] <= cutoff]
             else:
                 frame = load_ohlcv(self.bot_config.symbol, decision_timestamp, timeframe_override=self.bot_config.timeframe)
-            return detect_trend_pullback_candidate(frame, regime, self.config)
+            return detect_candidate(frame, regime, self.config, setup_family=setup_family)
         except Exception as exc:
             return CandidateSnapshot(
                 candidate_setup_present=False,
-                setup_family=str(self.config.get("bot_strategy_setup_family", "trend_pullback")),
+                setup_family=str(setup_family or regime.setup_family or self.config.get("bot_strategy_setup_family", "trend_pullback")),
                 direction=regime.preferred_action,
                 entry_zone_low=regime.pullback_zone_low,
                 entry_zone_high=regime.pullback_zone_high,
@@ -683,6 +700,26 @@ class BotRunner:
                 reclaim_confirmed=False,
                 reason=f"Candidate detection failed: {exc}",
             )
+
+    def _candidate_with_fallback(
+        self,
+        symbol: str,
+        decision_timestamp: str,
+        regime: RegimeSnapshot,
+        *,
+        setup_family: Optional[str] = None,
+        replay_bars: Optional[pd.DataFrame] = None,
+    ) -> CandidateSnapshot:
+        try:
+            return self._detect_candidate(
+                symbol,
+                decision_timestamp,
+                regime,
+                setup_family=setup_family,
+                replay_bars=replay_bars,
+            )
+        except TypeError:
+            return self._detect_candidate(symbol, decision_timestamp, regime, replay_bars=replay_bars)
 
     def _build_blocked_regime_decision(
         self,
@@ -767,6 +804,7 @@ class BotRunner:
         action: dict[str, Any],
         snapshot: ExchangeStateSnapshot,
         regime: RegimeSnapshot,
+        candidate: CandidateSnapshot,
     ) -> tuple[dict[str, Any], list[str]]:
         reasons: list[str] = []
         action_side = str(action.get("action", "")).upper()
@@ -776,19 +814,27 @@ class BotRunner:
         if str(action.get("symbol", "")).upper() != self._market_symbol(snapshot).upper():
             reasons.append("structured decision symbol does not match active market snapshot")
 
+        setup_family = str(candidate.setup_family or regime.setup_family or self.config.get("bot_strategy_setup_family", "trend_pullback"))
+
+        expected_direction = regime.preferred_action
+        if setup_family == "range_fade" and candidate.direction in {TradeAction.LONG.value, TradeAction.SHORT.value}:
+            expected_direction = candidate.direction
+
         if not regime.trade_allowed:
             reasons.append(f"regime {regime.label} is blocked for new entries")
-        elif action_side != regime.preferred_action:
+        elif expected_direction in {TradeAction.LONG.value, TradeAction.SHORT.value} and action_side != expected_direction:
             reasons.append(
-                f"direction {action_side} conflicts with regime preferred action {regime.preferred_action}"
+                f"direction {action_side} conflicts with expected direction {expected_direction}"
             )
+        if regime.allowed_setup_families and setup_family not in regime.allowed_setup_families:
+            reasons.append(f"strategy {setup_family} is not allowed in regime {regime.label}")
 
         planned_entry = self._planned_entry_price(action, snapshot)
         if planned_entry is None:
             reasons.append("unable to infer entry price for quality validation")
         else:
-            if not self._entry_in_pullback_zone(planned_entry, regime):
-                reasons.append("planned entry is outside the allowed pullback zone")
+            if not self._entry_in_candidate_zone(planned_entry, candidate):
+                reasons.append(f"planned entry is outside the allowed {setup_family} zone")
             distance_limit = self._entry_distance_limit_for_timeframe(self.bot_config.timeframe)
             mark_price = snapshot.mark_prices.get(self._market_symbol(snapshot), 0.0)
             if distance_limit is not None and mark_price > 0:
@@ -797,8 +843,8 @@ class BotRunner:
                     reasons.append(
                         f"planned entry distance {entry_distance_pct:.4f} exceeds limit {distance_limit:.4f}"
                     )
-            if not self._entry_orientation_is_pullback(action, planned_entry, mark_price):
-                reasons.append("entry orientation does not behave like a trend pullback")
+            if not self._entry_orientation_is_valid(action, planned_entry, mark_price, setup_family):
+                reasons.append(f"entry orientation does not behave like {setup_family}")
 
         reward_risk = self._reward_risk_ratio(action, planned_entry)
         if reward_risk is None:
@@ -809,7 +855,7 @@ class BotRunner:
             )
 
         if reasons:
-            return self._build_rejected_action(action, regime, reasons), reasons
+            return self._build_rejected_action(action, regime, reasons, setup_family), reasons
         return action, reasons
 
     def _build_rejected_action(
@@ -817,6 +863,7 @@ class BotRunner:
         action: dict[str, Any],
         regime: RegimeSnapshot,
         reasons: list[str],
+        setup_family: str,
     ) -> dict[str, Any]:
         reason_text = "; ".join(reasons)
         return {
@@ -828,7 +875,7 @@ class BotRunner:
             "entry_zone_low": None,
             "entry_zone_high": None,
             "confidence": 0.0,
-            "thesis_summary": f"Rejected {regime.setup_family}: {reason_text}",
+            "thesis_summary": f"Rejected {setup_family}: {reason_text}",
             "time_horizon": action.get("time_horizon", self.bot_config.timeframe),
             "stop_loss": None,
             "take_profit": None,
@@ -943,6 +990,7 @@ class BotRunner:
         *,
         data_source: str = "vendor",
         mode: str = "full-llm",
+        strategy_filter: Optional[str] = None,
     ) -> dict[str, Any]:
         replay_mode = mode.strip().lower()
         if replay_mode not in {"regime-only", "candidate-only", "full-llm"}:
@@ -964,124 +1012,180 @@ class BotRunner:
             )
             snapshot = self._historical_snapshot_for_timestamp(bars, ts)
             if replay_mode == "regime-only":
-                regime = self._classify_regime(
-                    state.symbol,
-                    ts.strftime("%Y-%m-%d %H:%M"),
-                    replay_bars=bars,
+                regime = self._replay_regime(state.symbol, ts.strftime("%Y-%m-%d %H:%M"), bars)
+                observations.append(
+                    self._build_replay_observation(
+                        bars,
+                        state.symbol,
+                        ts,
+                        replay_mode,
+                        regime,
+                        CandidateSnapshot(
+                            candidate_setup_present=False,
+                            setup_family="",
+                            direction=regime.preferred_action,
+                            entry_zone_low=None,
+                            entry_zone_high=None,
+                            invalidation_level=None,
+                            target_reference=None,
+                            reward_risk_estimate=None,
+                            reclaim_confirmed=False,
+                            reason="Regime-only replay skipped deterministic candidate detection.",
+                        ),
+                        self._build_replay_flat_action(
+                            state.symbol,
+                            ts.strftime("%Y-%m-%d %H:%M"),
+                            "Regime-only replay mode does not invoke candidate or LLM evaluation.",
+                        ),
+                        quality_filter_reasons=[],
+                        tool_errors=[],
+                        llm_evaluated=False,
+                    )
                 )
-                candidate = CandidateSnapshot(
-                    candidate_setup_present=False,
-                    setup_family=self.config.get("bot_strategy_setup_family", "trend_pullback"),
-                    direction=regime.preferred_action,
-                    entry_zone_low=regime.pullback_zone_low,
-                    entry_zone_high=regime.pullback_zone_high,
-                    invalidation_level=None,
-                    target_reference=None,
-                    reward_risk_estimate=None,
-                    reclaim_confirmed=False,
-                    reason="Regime-only replay skipped deterministic candidate detection.",
-                )
-                analysis = {
-                    "tool_errors": [],
-                    "final_state": {},
-                    "action": {},
-                    "diagnostics": {
-                        "regime": {**regime.to_dict(), "summary": regime.summary()},
-                        "candidate": {**candidate.to_dict(), "summary": candidate.summary()},
-                        "raw_action": {},
-                        "quality_filter_reasons": [],
-                        "final_action": {},
-                    },
-                }
+                continue
             elif replay_mode == "candidate-only":
-                regime = self._classify_regime(
-                    state.symbol,
-                    ts.strftime("%Y-%m-%d %H:%M"),
-                    replay_bars=bars,
-                )
-                candidate = self._detect_candidate(
-                    state.symbol,
-                    ts.strftime("%Y-%m-%d %H:%M"),
-                    regime,
-                    replay_bars=bars,
-                )
-                analysis = {
-                    "tool_errors": [],
-                    "final_state": {},
-                    "action": {},
-                    "diagnostics": {
-                        "regime": {**regime.to_dict(), "summary": regime.summary()},
-                        "candidate": {**candidate.to_dict(), "summary": candidate.summary()},
-                        "raw_action": {},
-                        "quality_filter_reasons": [],
-                        "final_action": {},
-                    },
-                }
+                regime = self._replay_regime(state.symbol, ts.strftime("%Y-%m-%d %H:%M"), bars)
+                strategies = [
+                    strategy
+                    for strategy in (regime.allowed_setup_families or [])
+                    if strategy_filter is None or strategy == strategy_filter
+                ]
+                if not strategies:
+                    observations.append(
+                        self._build_replay_observation(
+                            bars,
+                            state.symbol,
+                            ts,
+                            replay_mode,
+                            regime,
+                            CandidateSnapshot(
+                                candidate_setup_present=False,
+                                setup_family="",
+                                direction=regime.preferred_action,
+                                entry_zone_low=None,
+                                entry_zone_high=None,
+                                invalidation_level=None,
+                                target_reference=None,
+                                reward_risk_estimate=None,
+                                reclaim_confirmed=False,
+                                reason="No strategy is eligible for this regime in candidate-only replay.",
+                            ),
+                            self._build_replay_flat_action(
+                                state.symbol,
+                                ts.strftime("%Y-%m-%d %H:%M"),
+                                "Candidate-only replay mode found no eligible strategy for this bar.",
+                            ),
+                            quality_filter_reasons=[],
+                            tool_errors=[],
+                            llm_evaluated=False,
+                        )
+                    )
+                    continue
+                for strategy in strategies:
+                    candidate = self._candidate_with_fallback(
+                        state.symbol,
+                        ts.strftime("%Y-%m-%d %H:%M"),
+                        regime,
+                        setup_family=strategy,
+                        replay_bars=bars,
+                    )
+                    action = self._build_replay_flat_action(
+                        state.symbol,
+                        ts.strftime("%Y-%m-%d %H:%M"),
+                        "Candidate-only replay mode does not invoke LLM evaluation.",
+                    )
+                    if candidate.candidate_setup_present:
+                        action = {
+                            "symbol": state.symbol,
+                            "timestamp": ts.strftime("%Y-%m-%d %H:%M"),
+                            "action": candidate.direction,
+                            "entry_mode": "LIMIT_ZONE",
+                            "entry_price": None,
+                            "entry_zone_low": candidate.entry_zone_low,
+                            "entry_zone_high": candidate.entry_zone_high,
+                            "confidence": 0.5,
+                            "thesis_summary": candidate.reason,
+                            "time_horizon": self.bot_config.timeframe,
+                            "stop_loss": candidate.invalidation_level,
+                            "take_profit": candidate.target_reference,
+                            "invalidation": candidate.reason,
+                            "size_hint": "small",
+                            "setup_expiry_bars": self.bot_config.setup_expiry_bars_default,
+                            "position_instruction": "OPEN",
+                        }
+                    observations.append(
+                        self._build_replay_observation(
+                            bars,
+                            state.symbol,
+                            ts,
+                            replay_mode,
+                            regime,
+                            candidate,
+                            action,
+                            quality_filter_reasons=[],
+                            tool_errors=[],
+                            llm_evaluated=False,
+                        )
+                    )
+                continue
             else:
+                regime = self._replay_regime(state.symbol, ts.strftime("%Y-%m-%d %H:%M"), bars)
+                strategy = self._select_strategy_for_regime(regime)
+                if strategy_filter is not None and strategy != strategy_filter:
+                    observations.append(
+                        self._build_replay_observation(
+                            bars,
+                            state.symbol,
+                            ts,
+                            replay_mode,
+                            regime,
+                            CandidateSnapshot(
+                                candidate_setup_present=False,
+                                setup_family=strategy or "",
+                                direction=regime.preferred_action,
+                                entry_zone_low=None,
+                                entry_zone_high=None,
+                                invalidation_level=None,
+                                target_reference=None,
+                                reward_risk_estimate=None,
+                                reclaim_confirmed=False,
+                                reason="Bar skipped because routed strategy did not match replay strategy filter.",
+                            ),
+                            self._build_replay_flat_action(
+                                state.symbol,
+                                ts.strftime("%Y-%m-%d %H:%M"),
+                                "Replay strategy filter skipped this routed bar.",
+                            ),
+                            quality_filter_reasons=[],
+                            tool_errors=[],
+                            llm_evaluated=False,
+                        )
+                    )
+                    continue
                 analysis = self._analyze_decision(
                     state,
                     snapshot,
                     ts.strftime("%Y-%m-%d %H:%M"),
                     replay_bars=bars,
+                    strategy_family=strategy,
                 )
-            action = analysis["action"]
-            if replay_mode == "regime-only":
-                action = self._build_replay_flat_action(
-                    state.symbol,
-                    ts.strftime("%Y-%m-%d %H:%M"),
-                    "Regime-only replay mode does not invoke candidate or LLM evaluation.",
+                observations.append(
+                    self._build_replay_observation(
+                        bars,
+                        state.symbol,
+                        ts,
+                        replay_mode,
+                        RegimeSnapshot(**{k: v for k, v in analysis["diagnostics"]["regime"].items() if k != "summary"}),
+                        CandidateSnapshot(**{k: v for k, v in analysis["diagnostics"]["candidate"].items() if k != "summary"}),
+                        analysis["action"],
+                        quality_filter_reasons=analysis["diagnostics"]["quality_filter_reasons"],
+                        tool_errors=analysis["tool_errors"],
+                        llm_evaluated=bool(
+                            analysis["diagnostics"]["candidate"]["candidate_setup_present"]
+                            and analysis["diagnostics"]["regime"]["trade_allowed"]
+                        ),
+                    )
                 )
-            elif replay_mode == "candidate-only":
-                action = self._build_replay_flat_action(
-                    state.symbol,
-                    ts.strftime("%Y-%m-%d %H:%M"),
-                    "Candidate-only replay mode does not invoke LLM evaluation.",
-                )
-                if analysis["diagnostics"]["candidate"]["candidate_setup_present"]:
-                    action = {
-                        "symbol": state.symbol,
-                        "timestamp": ts.strftime("%Y-%m-%d %H:%M"),
-                        "action": analysis["diagnostics"]["candidate"]["direction"],
-                        "entry_mode": "LIMIT_ZONE",
-                        "entry_price": None,
-                        "entry_zone_low": analysis["diagnostics"]["candidate"]["entry_zone_low"],
-                        "entry_zone_high": analysis["diagnostics"]["candidate"]["entry_zone_high"],
-                        "confidence": 0.5,
-                        "thesis_summary": analysis["diagnostics"]["candidate"]["reason"],
-                        "time_horizon": self.bot_config.timeframe,
-                        "stop_loss": analysis["diagnostics"]["candidate"]["invalidation_level"],
-                        "take_profit": analysis["diagnostics"]["candidate"]["target_reference"],
-                        "invalidation": analysis["diagnostics"]["candidate"]["reason"],
-                        "size_hint": "small",
-                        "setup_expiry_bars": self.bot_config.setup_expiry_bars_default,
-                        "position_instruction": "OPEN",
-                    }
-            observation = {
-                "decision_timestamp": ts.isoformat(),
-                "symbol": state.symbol,
-                "timeframe": self.bot_config.timeframe,
-                "replay_mode": replay_mode,
-                "setup_family": self.config.get("bot_strategy_setup_family", "trend_pullback"),
-                "regime_label": analysis["diagnostics"]["regime"]["label"],
-                "regime_trade_allowed": analysis["diagnostics"]["regime"]["trade_allowed"],
-                "candidate_setup_present": analysis["diagnostics"]["candidate"]["candidate_setup_present"],
-                "quality_filter_reasons": analysis["diagnostics"]["quality_filter_reasons"],
-                "tool_errors": analysis["tool_errors"],
-                "raw_action": analysis["diagnostics"]["raw_action"],
-                "final_action": action,
-                "llm_evaluated": replay_mode == "full-llm"
-                and analysis["diagnostics"]["candidate"]["candidate_setup_present"]
-                and analysis["diagnostics"]["regime"]["trade_allowed"],
-            }
-            observation.update(
-                evaluate_replay_observation(
-                    bars,
-                    ts.isoformat(),
-                    action,
-                    setup_expiry_bars_default=self.bot_config.setup_expiry_bars_default,
-                )
-            )
-            observations.append(observation)
         return {
             "symbol": self.bot_config.symbol,
             "timeframe": self.bot_config.timeframe,
@@ -1089,6 +1193,7 @@ class BotRunner:
             "end_timestamp": end_timestamp,
             "data_source": data_source,
             "mode": replay_mode,
+            "strategy_filter": strategy_filter,
             "observations": observations,
             "summary": summarize_replay(observations),
         }
@@ -1182,6 +1287,58 @@ class BotRunner:
             "position_instruction": "NO_ACTION",
         }
 
+    def _replay_regime(
+        self,
+        symbol: str,
+        decision_timestamp: str,
+        replay_bars: pd.DataFrame,
+    ) -> RegimeSnapshot:
+        try:
+            return self._classify_regime(symbol, decision_timestamp, replay_bars=replay_bars)
+        except TypeError:
+            return self._classify_regime(symbol, decision_timestamp)
+
+    def _build_replay_observation(
+        self,
+        bars: pd.DataFrame,
+        symbol: str,
+        timestamp: pd.Timestamp,
+        replay_mode: str,
+        regime: RegimeSnapshot,
+        candidate: CandidateSnapshot,
+        action: dict[str, Any],
+        *,
+        quality_filter_reasons: list[str],
+        tool_errors: list[str],
+        llm_evaluated: bool,
+    ) -> dict[str, Any]:
+        observation = {
+            "decision_timestamp": timestamp.isoformat(),
+            "symbol": symbol,
+            "timeframe": self.bot_config.timeframe,
+            "replay_mode": replay_mode,
+            "allowed_setup_families": regime.allowed_setup_families,
+            "setup_family": candidate.setup_family or regime.setup_family,
+            "regime_label": regime.label,
+            "regime_trade_allowed": regime.trade_allowed,
+            "candidate_setup_present": candidate.candidate_setup_present,
+            "candidate_reason": candidate.reason,
+            "quality_filter_reasons": quality_filter_reasons,
+            "tool_errors": tool_errors,
+            "raw_action": action,
+            "final_action": action,
+            "llm_evaluated": llm_evaluated,
+        }
+        observation.update(
+            evaluate_replay_observation(
+                bars,
+                timestamp.isoformat(),
+                action,
+                setup_expiry_bars_default=self.bot_config.setup_expiry_bars_default,
+            )
+        )
+        return observation
+
     def _market_symbol(self, snapshot: ExchangeStateSnapshot) -> str:
         if snapshot.mark_prices:
             return next(iter(snapshot.mark_prices.keys()))
@@ -1229,27 +1386,40 @@ class BotRunner:
             return None
         return reward / risk
 
-    def _entry_in_pullback_zone(self, planned_entry: float, regime: RegimeSnapshot) -> bool:
-        if regime.pullback_zone_low is None or regime.pullback_zone_high is None:
+    def _entry_in_candidate_zone(self, planned_entry: float, candidate: CandidateSnapshot) -> bool:
+        if candidate.entry_zone_low is None or candidate.entry_zone_high is None:
             return False
-        return regime.pullback_zone_low <= planned_entry <= regime.pullback_zone_high
+        return candidate.entry_zone_low <= planned_entry <= candidate.entry_zone_high
 
-    def _entry_orientation_is_pullback(
+    def _entry_orientation_is_valid(
         self,
         action: dict[str, Any],
         planned_entry: float,
         mark_price: float,
+        setup_family: str,
     ) -> bool:
         side = str(action.get("action", "")).upper()
         entry_mode = str(action.get("entry_mode") or "MARKET").upper()
         tolerance = mark_price * 0.002
         if entry_mode == "MARKET":
             return True
+        if setup_family == "range_fade":
+            if side == TradeAction.LONG.value:
+                return planned_entry <= mark_price + tolerance
+            if side == TradeAction.SHORT.value:
+                return planned_entry >= mark_price - tolerance
+            return False
         if side == TradeAction.LONG.value:
             return planned_entry <= mark_price + tolerance
         if side == TradeAction.SHORT.value:
             return planned_entry >= mark_price - tolerance
         return False
+
+    def _select_strategy_for_regime(self, regime: RegimeSnapshot) -> Optional[str]:
+        if regime.allowed_setup_families:
+            return regime.allowed_setup_families[0]
+        allowed = allowed_strategies_for_regime(regime.label, self.config)
+        return allowed[0] if allowed else None
 
     def _extract_tool_errors(self, final_state: dict) -> list[str]:
         messages = final_state.get("messages") or []
@@ -1301,6 +1471,8 @@ class BotRunner:
             analysis_timestamp=analysis_timestamp,
             regime_snapshot=diagnostics.get("regime"),
             candidate_snapshot=diagnostics.get("candidate"),
+            allowed_setup_families=(diagnostics.get("regime") or {}).get("allowed_setup_families", []),
+            selected_setup_family=(diagnostics.get("candidate") or {}).get("setup_family"),
             raw_action=diagnostics.get("raw_action"),
             final_action=action or diagnostics.get("final_action"),
             quality_filter_reasons=diagnostics.get("quality_filter_reasons"),

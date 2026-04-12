@@ -18,6 +18,7 @@ def create_market_analyst(llm):
         analysis_timeframe = get_config().get("analysis_timeframe", "1d")
         regime_summary = state.get("regime_summary", "")
         setup_family = state.get("setup_family", "trend_pullback")
+        allowed_setup_families = state.get("allowed_setup_families", []) or []
         regime_context = state.get("regime_context", {}) or {}
         candidate_summary = state.get("candidate_summary", "")
         candidate_context = state.get("candidate_context", {}) or {}
@@ -42,6 +43,7 @@ def create_market_analyst(llm):
             f"""You are a trading assistant tasked with analyzing financial markets for an autonomous Hyperliquid bot. Your role is to validate one approved setup family instead of brainstorming multiple trade ideas.
 
 Approved setup family: **{setup_family}**
+Allowed strategy families for this regime: **{', '.join(allowed_setup_families) or 'none'}**
 Deterministic regime gate:
 - {regime_summary or 'No regime summary provided.'}
 - The regime payload says trade_allowed={str(trade_allowed).lower()} and preferred_action={preferred_action}.
@@ -49,8 +51,8 @@ Deterministic regime gate:
 - {candidate_summary or 'No candidate summary provided.'}
 - The candidate payload says candidate_setup_present={str(bool(candidate_context.get("candidate_setup_present"))).lower()} and direction={candidate_context.get("direction", preferred_action)}.
 - If trade_allowed is false, do not manufacture a trade. State clearly that this bar is a no-trade regime.
-- If candidate_setup_present is false, do not manufacture a trade. Explain why the pullback candidate failed and preserve a no-trade stance.
-- If trade_allowed is true, evaluate only whether the approved setup is present in the preferred direction. Do not propose range fades, breakout chases, or countertrend reversals.
+- If candidate_setup_present is false, do not manufacture a trade. Explain why the routed {setup_family} candidate failed and preserve a no-trade stance.
+- If trade_allowed is true, evaluate only whether the approved setup is present in the routed direction. For trend_pullback that is the regime preferred direction; for range_fade that is the candidate direction at the active range edge. Do not propose alternate setups.
 - Your report must explicitly answer:
   1. Is a valid {setup_family} setup present? yes/no
   2. What is the directional bias?
@@ -85,6 +87,17 @@ Volume-Based Indicators:
 - Select indicators that provide diverse and complementary information. Avoid redundancy (e.g., do not select both rsi and stochrsi). Also briefly explain why they are suitable for the given market context. The configured analysis timeframe for this run is **{analysis_timeframe}** and you should interpret the retrieved OHLCV and indicators on that timeframe. {intraday_instruction} When you tool call, please use the exact name of the indicators provided above as they are defined parameters, otherwise your call will fail. Please make sure to call get_stock_data first to retrieve the CSV that is needed to generate indicators. Then use get_indicators with the specific indicator names. Do not request unnecessarily long raw OHLCV ranges for intraday runs. Write a detailed report focused on whether the approved setup is valid right now. Make sure to append a Markdown table at the end of the report to organize key points in the report, organized and easy to read."""
             + get_language_instruction()
         )
+        if setup_family == "range_fade":
+            system_message += (
+                "\nFor range_fade specifically: validate bounded range behavior, identify the active range low/high, "
+                "confirm whether price is rejecting an edge rather than drifting in the middle, place invalidation just outside the range, "
+                "and do not convert a developing breakout into a fade trade."
+            )
+        else:
+            system_message += (
+                "\nFor trend_pullback specifically: validate continuation with a pullback into the allowed zone, "
+                "prefer reclaim/continuation evidence, and do not chase extension bars far from the pullback zone."
+            )
 
         prompt = ChatPromptTemplate.from_messages(
             [

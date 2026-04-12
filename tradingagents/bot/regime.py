@@ -14,6 +14,7 @@ class RegimeSnapshot:
     trade_allowed: bool
     preferred_action: str
     setup_family: str
+    allowed_setup_families: list[str]
     current_price: float
     ema20: float
     ema50: float
@@ -37,12 +38,19 @@ class RegimeSnapshot:
             zone = f"{self.pullback_zone_low:.2f}-{self.pullback_zone_high:.2f}"
         return (
             f"Regime={self.label} | trade_allowed={self.trade_allowed} | preferred_action={self.preferred_action} | "
-            f"setup_family={self.setup_family} | price={self.current_price:.2f} | ema20={self.ema20:.2f} | "
+            f"setup_family={self.setup_family} | allowed={','.join(self.allowed_setup_families) or 'none'} | "
+            f"price={self.current_price:.2f} | ema20={self.ema20:.2f} | "
             f"ema50={self.ema50:.2f} | atr14={self.atr14:.2f} ({self.atr_pct:.4f}) | "
             f"ema20_slope_pct={self.ema20_slope_pct:.4f} | trend_spread_pct={self.trend_spread_pct:.4f} | "
             f"realized_vol_24h={self.realized_vol_24h:.4f} | bar_change_pct={self.bar_change_pct:.4f} | "
             f"pullback_distance_atr={self.pullback_distance_atr:.2f} | pullback_zone={zone} | reason={self.reason}"
         )
+
+
+def allowed_strategies_for_regime(label: str, config: dict) -> list[str]:
+    enabled = set(_enabled_strategy_families(config))
+    route_map = _strategy_route_map(config)
+    return [strategy for strategy in route_map.get(label, []) if strategy in enabled]
 
 
 def classify_regime(symbol: str, trade_timestamp: str, config: dict) -> RegimeSnapshot:
@@ -69,7 +77,8 @@ def classify_regime_from_data(
             label="low_quality",
             trade_allowed=False,
             preferred_action="FLAT",
-            setup_family=str(config.get("bot_strategy_setup_family", "trend_pullback")),
+            setup_family="",
+            allowed_setup_families=[],
             current_price=0.0,
             ema20=0.0,
             ema50=0.0,
@@ -111,48 +120,55 @@ def classify_regime_from_data(
     bar_shock_atr_multiple = float(config.get("bot_regime_bar_shock_atr_multiple", 1.8))
     pullback_atr_tolerance = float(config.get("bot_pullback_atr_tolerance", 0.75))
 
+    def snapshot_for(
+        label: str,
+        preferred_action: str,
+        reason: str,
+        *,
+        pullback_zone_low: Optional[float],
+        pullback_zone_high: Optional[float],
+    ) -> RegimeSnapshot:
+        allowed = allowed_strategies_for_regime(label, config)
+        selected = allowed[0] if allowed else ""
+        return RegimeSnapshot(
+            label=label,
+            trade_allowed=bool(allowed),
+            preferred_action=preferred_action,
+            setup_family=selected or setup_family,
+            allowed_setup_families=allowed,
+            current_price=current_price,
+            ema20=ema20,
+            ema50=ema50,
+            atr14=atr14,
+            atr_pct=atr_pct,
+            ema20_slope_pct=ema20_slope_pct,
+            trend_spread_pct=trend_spread_pct,
+            realized_vol_24h=realized_vol_24h,
+            bar_change_pct=bar_change_pct,
+            pullback_distance_atr=pullback_distance_atr,
+            pullback_zone_low=pullback_zone_low,
+            pullback_zone_high=pullback_zone_high,
+            reason=reason,
+        )
+
     if atr_pct >= volatility_event_atr_pct or (
         atr_pct > 0 and abs(bar_change_pct) >= atr_pct * bar_shock_atr_multiple
     ):
-        return RegimeSnapshot(
-            label="high_volatility_event",
-            trade_allowed=False,
-            preferred_action="FLAT",
-            setup_family=setup_family,
-            current_price=current_price,
-            ema20=ema20,
-            ema50=ema50,
-            atr14=atr14,
-            atr_pct=atr_pct,
-            ema20_slope_pct=ema20_slope_pct,
-            trend_spread_pct=trend_spread_pct,
-            realized_vol_24h=realized_vol_24h,
-            bar_change_pct=bar_change_pct,
-            pullback_distance_atr=pullback_distance_atr,
+        return snapshot_for(
+            "high_volatility_event",
+            "FLAT",
+            reason="Volatility shock detected; hard-skip new entries in event conditions.",
             pullback_zone_low=None,
             pullback_zone_high=None,
-            reason="Volatility shock detected; hard-skip new entries in event conditions.",
         )
 
     if trend_spread_pct <= range_spread_max and abs(ema20_slope_pct) <= range_slope_max:
-        return RegimeSnapshot(
-            label="range",
-            trade_allowed=False,
-            preferred_action="FLAT",
-            setup_family=setup_family,
-            current_price=current_price,
-            ema20=ema20,
-            ema50=ema50,
-            atr14=atr14,
-            atr_pct=atr_pct,
-            ema20_slope_pct=ema20_slope_pct,
-            trend_spread_pct=trend_spread_pct,
-            realized_vol_24h=realized_vol_24h,
-            bar_change_pct=bar_change_pct,
-            pullback_distance_atr=pullback_distance_atr,
+        return snapshot_for(
+            "range",
+            "FLAT",
+            reason="Trend spread and EMA slope are too weak; classify as chop/range.",
             pullback_zone_low=None,
             pullback_zone_high=None,
-            reason="Trend spread and EMA slope are too weak; classify as chop/range.",
         )
 
     if (
@@ -160,21 +176,9 @@ def classify_regime_from_data(
         and trend_spread_pct >= trend_spread_min
         and ema20_slope_pct >= trend_slope_min
     ):
-        return RegimeSnapshot(
-            label="trend_up",
-            trade_allowed=True,
-            preferred_action="LONG",
-            setup_family=setup_family,
-            current_price=current_price,
-            ema20=ema20,
-            ema50=ema50,
-            atr14=atr14,
-            atr_pct=atr_pct,
-            ema20_slope_pct=ema20_slope_pct,
-            trend_spread_pct=trend_spread_pct,
-            realized_vol_24h=realized_vol_24h,
-            bar_change_pct=bar_change_pct,
-            pullback_distance_atr=pullback_distance_atr,
+        return snapshot_for(
+            "trend_up",
+            "LONG",
             pullback_zone_low=max(0.0, ema20 - atr14 * pullback_atr_tolerance),
             pullback_zone_high=ema20 + atr14 * (pullback_atr_tolerance * 0.35),
             reason="Uptrend confirmed by EMA stack, spread, and positive EMA slope.",
@@ -185,44 +189,20 @@ def classify_regime_from_data(
         and trend_spread_pct >= trend_spread_min
         and ema20_slope_pct <= -trend_slope_min
     ):
-        return RegimeSnapshot(
-            label="trend_down",
-            trade_allowed=True,
-            preferred_action="SHORT",
-            setup_family=setup_family,
-            current_price=current_price,
-            ema20=ema20,
-            ema50=ema50,
-            atr14=atr14,
-            atr_pct=atr_pct,
-            ema20_slope_pct=ema20_slope_pct,
-            trend_spread_pct=trend_spread_pct,
-            realized_vol_24h=realized_vol_24h,
-            bar_change_pct=bar_change_pct,
-            pullback_distance_atr=pullback_distance_atr,
+        return snapshot_for(
+            "trend_down",
+            "SHORT",
             pullback_zone_low=max(0.0, ema20 - atr14 * (pullback_atr_tolerance * 0.35)),
             pullback_zone_high=ema20 + atr14 * pullback_atr_tolerance,
             reason="Downtrend confirmed by EMA stack, spread, and negative EMA slope.",
         )
 
-    return RegimeSnapshot(
-        label="low_quality",
-        trade_allowed=False,
-        preferred_action="FLAT",
-        setup_family=setup_family,
-        current_price=current_price,
-        ema20=ema20,
-        ema50=ema50,
-        atr14=atr14,
-        atr_pct=atr_pct,
-        ema20_slope_pct=ema20_slope_pct,
-        trend_spread_pct=trend_spread_pct,
-        realized_vol_24h=realized_vol_24h,
-        bar_change_pct=bar_change_pct,
-        pullback_distance_atr=pullback_distance_atr,
+    return snapshot_for(
+        "low_quality",
+        "FLAT",
+        reason="Market structure is ambiguous and does not qualify as trend pullback regime.",
         pullback_zone_low=None,
         pullback_zone_high=None,
-        reason="Market structure is ambiguous and does not qualify as trend pullback regime.",
     )
 
 
@@ -231,7 +211,8 @@ def _unsupported_timeframe_snapshot(config: dict, timeframe: str) -> RegimeSnaps
         label="low_quality",
         trade_allowed=False,
         preferred_action="FLAT",
-        setup_family=str(config.get("bot_strategy_setup_family", "trend_pullback")),
+        setup_family="",
+        allowed_setup_families=[],
         current_price=0.0,
         ema20=0.0,
         ema50=0.0,
@@ -270,3 +251,34 @@ def _safe_float(value) -> float:
     if pd.isna(value):
         return 0.0
     return float(value)
+
+
+def _enabled_strategy_families(config: dict) -> list[str]:
+    configured = config.get("bot_enabled_strategy_families")
+    if isinstance(configured, (list, tuple)):
+        values = [str(item).strip() for item in configured if str(item).strip()]
+        if values:
+            return values
+    fallback = str(config.get("bot_strategy_setup_family", "trend_pullback")).strip()
+    return [fallback] if fallback else ["trend_pullback"]
+
+
+def _strategy_route_map(config: dict) -> dict[str, list[str]]:
+    configured = config.get("bot_regime_strategy_map")
+    if isinstance(configured, dict):
+        route_map: dict[str, list[str]] = {}
+        for label, families in configured.items():
+            if isinstance(families, (list, tuple)):
+                route_map[str(label)] = [str(item).strip() for item in families if str(item).strip()]
+            elif families:
+                route_map[str(label)] = [str(families).strip()]
+            else:
+                route_map[str(label)] = []
+        return route_map
+    return {
+        "trend_up": ["trend_pullback"],
+        "trend_down": ["trend_pullback"],
+        "range": ["range_fade"],
+        "high_volatility_event": [],
+        "low_quality": [],
+    }

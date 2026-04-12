@@ -27,6 +27,7 @@ class Propagator:
             "bot_state_summary": "",
             "regime_summary": "",
             "regime_context": {},
+            "allowed_setup_families": [],
             "candidate_summary": "",
             "candidate_context": {},
             "setup_family": "",

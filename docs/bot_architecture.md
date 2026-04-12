@@ -8,11 +8,11 @@ The bot is currently optimized for a narrow, measurable first live strategy:
 
 - Market: `BTC-USD`
 - Timeframe: `1h`
-- Strategy family: `trend_pullback`
+- Strategy families: `trend_pullback`, `range_fade`
 - Execution venue: Hyperliquid
-- Design goal: deterministic gating first, LLM refinement second, deterministic execution validation last
+- Design goal: deterministic regime routing first, LLM refinement second, deterministic execution validation last
 
-The system is intentionally narrow. It is not meant to support broad discretionary multi-strategy trading yet.
+The system is still intentionally explicit. It supports a small routed strategy set rather than broad discretionary multi-strategy trading.
 
 ## Core Live Flow
 
@@ -22,16 +22,17 @@ For each eligible analysis bar, the flow is:
 
 1. Sync exchange state from Hyperliquid.
 2. Run deterministic regime classification.
-3. Run deterministic setup candidate detection.
-4. If either gate fails, return synthetic `FLAT/NO_ACTION` without invoking the graph.
-5. If both gates pass, invoke the LLM graph.
-6. Parse the structured trade decision.
-7. Apply deterministic post-parse quality filters.
-8. If the decision still passes, convert it into an order intent and execute.
+3. Route the active regime to its allowed strategy family.
+4. Run deterministic setup candidate detection for the routed strategy.
+5. If any deterministic gate fails, return synthetic `FLAT/NO_ACTION` without invoking the graph.
+6. If the routed strategy produces a valid candidate, invoke the LLM graph.
+7. Parse the structured trade decision.
+8. Apply deterministic post-parse quality filters.
+9. If the decision still passes, convert it into an order intent and execute.
 
 The intended shape is:
 
-`market data -> regime gate -> candidate gate -> LLM graph -> quality filter -> execution`
+`market data -> regime gate -> strategy router -> candidate gate -> LLM graph -> quality filter -> execution`
 
 ## Deterministic Gates
 
@@ -51,10 +52,12 @@ Current labels:
 - `high_volatility_event`
 - `low_quality`
 
-Current behavior:
+Current routing behavior:
 
-- `trend_up` / `trend_down`: trade-eligible
-- `range` / `high_volatility_event` / `low_quality`: hard skip
+- `trend_up` -> `trend_pullback`
+- `trend_down` -> `trend_pullback`
+- `range` -> `range_fade`
+- `high_volatility_event` / `low_quality` -> hard skip
 
 The regime gate derives EMA structure, ATR-based volatility, slope, spread, and pullback-zone metadata.
 
@@ -65,16 +68,23 @@ Implemented in [tradingagents/bot/candidate.py](/Users/evlogialeksandrov/repos/T
 Purpose:
 
 - decide whether the current bar is worth an LLM call
-- detect only a plausible `trend_pullback` candidate
+- detect a plausible candidate for the routed strategy only
 - not generate the final trade
 
-Current candidate requirements:
+Current supported candidate detectors:
 
-- regime must already be tradable
-- recent bars must retrace into the allowed pullback zone
-- reclaim/continuation confirmation must exist
-- an invalidation level must be derivable
-- estimated reward-to-risk must exceed configured minimum
+- `trend_pullback`
+  - regime must already route to trend continuation
+  - recent bars must retrace into the allowed pullback zone
+  - reclaim/continuation confirmation must exist
+  - an invalidation level must be derivable
+  - estimated reward-to-risk must exceed configured minimum
+- `range_fade`
+  - regime must already route to range mean reversion
+  - recent structure must remain inside a bounded range
+  - price must be near a range edge, not mid-range
+  - edge rejection/reversal confirmation must exist
+  - stop and target must fit a favorable reward-to-risk profile
 
 If `candidate_setup_present=False`, the graph is skipped entirely.
 
@@ -94,9 +104,10 @@ The graph is now prompt-constrained by:
 
 - regime summary
 - regime payload
+- allowed setup families
 - candidate summary
 - candidate payload
-- approved setup family
+- routed setup family
 
 The graph should not invent alternate setups when deterministic gates say no trade.
 
@@ -108,8 +119,9 @@ After the portfolio manager emits a structured decision, the bot validates:
 
 - symbol matches active market
 - direction matches regime bias
-- entry is inside the allowed pullback zone
-- entry orientation behaves like a pullback, not a chase
+- strategy is allowed for the active regime
+- entry is inside the routed candidate zone
+- entry orientation behaves like the routed strategy, not an invalid chase
 - reward-to-risk exceeds configured minimum
 - entry distance from mark price is within limit
 
@@ -142,10 +154,17 @@ Important replay detail:
 Replay metrics currently include:
 
 - signal count
-- executed vs skipped
+- simulated trades vs no-trade
 - regime grouping
+- strategy grouping
 - `R_1`, `R_2`, `R_4`, `R_8`
 - `MAE` / `MFE`
+
+Replay modes:
+
+- `regime-only`: classify regimes only
+- `candidate-only`: evaluate deterministic candidates without invoking the LLM graph
+- `full-llm`: run the same routed strategy flow as live, including the graph
 
 ## State and Diagnostics
 
@@ -191,6 +210,7 @@ Each row currently stores:
 - decision timestamp
 - analysis timestamp
 - regime label and regime payload
+- allowed strategy families and selected strategy family
 - candidate direction and candidate payload
 - raw action payload
 - final action payload
@@ -209,11 +229,13 @@ Defined in [tradingagents/default_config.py](/Users/evlogialeksandrov/repos/Trad
 
 Key bot-specific defaults:
 
-- `bot_strategy_setup_family = "trend_pullback"`
+- `bot_enabled_strategy_families = ["trend_pullback", "range_fade"]`
+- `bot_regime_strategy_map = {"trend_up": ["trend_pullback"], "trend_down": ["trend_pullback"], "range": ["range_fade"]}`
 - `bot_min_reward_risk = 1.8`
 - `bot_journal_path = "./results/bot_journal.sqlite"`
 - regime thresholds for spread/slope/volatility
 - `bot_pullback_atr_tolerance`
+- range-fade thresholds for edge proximity, width sanity, stop buffer, and target buffer
 - per-timeframe max entry distance
 
 If changing strategy behavior, check config defaults before changing prompt text.
@@ -221,7 +243,6 @@ If changing strategy behavior, check config defaults before changing prompt text
 ## Known Current Constraints
 
 - v1 logic is intentionally optimized for `BTC 1h`
-- broader multi-strategy support is not implemented yet
 - replay can still hit LLM-provider auth issues if bars pass deterministic gates and the configured provider credentials are invalid
 - the graph still contains debate/research stages, but deterministic gates now prevent most unnecessary LLM calls
 
@@ -229,10 +250,10 @@ If changing strategy behavior, check config defaults before changing prompt text
 
 If continuing the bot work, the most natural next steps are:
 
-1. Add replay modes such as `regime-only`, `candidate-only`, and `full-llm`.
-2. Add a second strategy family, likely `breakout_retest`, behind the same deterministic gate framework.
-3. Persist replay outputs and decision diagnostics into dedicated strategy-evaluation artifacts.
-4. Reduce graph breadth for live bot mode if the remaining debate stages are still too expensive.
+1. Add `breakout_retest` behind the same deterministic regime router.
+2. Persist replay outputs and decision diagnostics into dedicated strategy-evaluation artifacts.
+3. Reduce graph breadth for live bot mode if the remaining debate stages are still too expensive.
+4. Add strategy-specific calibration from the SQLite journal and replay outputs.
 
 ## Strategy Glossary
 
@@ -280,13 +301,17 @@ Likely future use:
 
 ### range_fade
 
-Not implemented yet.
-
 Intended meaning:
 
 - trade reversions at the edges of a clearly defined range
 - buy near support and sell near resistance
 - should only be used when the market is classified as range-bound, not trending
+
+Current bot usage:
+
+- `range` regime routes to `range_fade`
+- candidate detection requires an edge touch plus rejection confirmation
+- entries should stay near the range boundary and invalidation sits just outside the range
 
 ## Quick Commands
 
@@ -304,7 +329,8 @@ python cli/main.py bot-replay \
   --timeframe 1h \
   --start "2026-03-01 00:00" \
   --end "2026-04-11 23:00" \
-  --data-source vendor
+  --data-source vendor \
+  --mode candidate-only
 ```
 
 Replay with Hyperliquid candles:
@@ -316,6 +342,7 @@ python cli/main.py bot-replay \
   --start "2026-03-01 00:00" \
   --end "2026-04-11 23:00" \
   --data-source hyperliquid \
+  --mode full-llm \
   --testnet
 ```
 

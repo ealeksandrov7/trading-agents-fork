@@ -55,6 +55,7 @@ class BotRunnerPlannerTests(unittest.TestCase):
             trade_allowed=True,
             preferred_action="SHORT",
             setup_family="trend_pullback",
+            allowed_setup_families=["trend_pullback"],
             current_price=70000,
             ema20=70100,
             ema50=70600,
@@ -455,6 +456,7 @@ class BotRunnerPlannerTests(unittest.TestCase):
                     trade_allowed=False,
                     preferred_action="FLAT",
                     setup_family="trend_pullback",
+                    allowed_setup_families=[],
                     current_price=70000,
                     ema20=70000,
                     ema50=70010,
@@ -526,6 +528,7 @@ class BotRunnerPlannerTests(unittest.TestCase):
                     trade_allowed=True,
                     preferred_action="LONG",
                     setup_family="trend_pullback",
+                    allowed_setup_families=["trend_pullback"],
                     current_price=70000,
                     ema20=69900,
                     ema50=69200,
@@ -578,7 +581,7 @@ class BotRunnerPlannerTests(unittest.TestCase):
             self.assertEqual(executor.calls, 0)
             rejection_events = [event for event in events if event.event_type == "decision_rejected"]
             self.assertEqual(len(rejection_events), 1)
-            self.assertIn("conflicts with regime preferred action", rejection_events[0].payload["reasons"][0])
+            self.assertIn("conflicts with expected direction", rejection_events[0].payload["reasons"][0])
 
     def test_missing_candidate_skips_graph_even_in_tradable_regime(self):
         class StubExecutor:
@@ -614,6 +617,7 @@ class BotRunnerPlannerTests(unittest.TestCase):
                     trade_allowed=True,
                     preferred_action="LONG",
                     setup_family="trend_pullback",
+                    allowed_setup_families=["trend_pullback"],
                     current_price=70000,
                     ema20=69900,
                     ema50=69200,
@@ -704,6 +708,7 @@ class BotRunnerPlannerTests(unittest.TestCase):
                     trade_allowed=True,
                     preferred_action="LONG",
                     setup_family="trend_pullback",
+                    allowed_setup_families=["trend_pullback"],
                     current_price=70000,
                     ema20=69900,
                     ema50=69200,
@@ -797,6 +802,7 @@ class BotRunnerPlannerTests(unittest.TestCase):
                     trade_allowed=True,
                     preferred_action="LONG",
                     setup_family="trend_pullback",
+                    allowed_setup_families=["trend_pullback"],
                     current_price=70000,
                     ema20=69900,
                     ema50=69200,
@@ -968,6 +974,135 @@ class BotRunnerPlannerTests(unittest.TestCase):
             self.assertEqual(result["mode"], "candidate-only")
             self.assertEqual(result["summary"]["llm_evaluated"], 0)
 
+    def test_candidate_only_replay_reports_by_strategy(self):
+        class ReplayRunner(BotRunner):
+            def _load_replay_bars(self, symbol, start_timestamp, end_timestamp, *, data_source="vendor"):
+                base = pd.Timestamp("2026-04-07 00:00", tz="UTC")
+                rows = []
+                for idx in range(80):
+                    ts = base + pd.Timedelta(hours=idx)
+                    close = 70000.0
+                    rows.append(
+                        {
+                            "Date": ts,
+                            "Open": close - 10.0,
+                            "High": close + 40.0,
+                            "Low": close - 40.0,
+                            "Close": close,
+                            "Volume": 1000 + idx,
+                        }
+                    )
+                return pd.DataFrame(rows)
+
+            def _classify_regime(self, symbol, decision_timestamp, *, replay_bars=None):
+                return RegimeSnapshot(
+                    label="range",
+                    trade_allowed=True,
+                    preferred_action="FLAT",
+                    setup_family="range_fade",
+                    allowed_setup_families=["range_fade"],
+                    current_price=70000,
+                    ema20=70000,
+                    ema50=70005,
+                    atr14=250,
+                    atr_pct=0.0035,
+                    ema20_slope_pct=0.0,
+                    trend_spread_pct=0.0002,
+                    realized_vol_24h=0.004,
+                    bar_change_pct=0.0002,
+                    pullback_distance_atr=0.1,
+                    pullback_zone_low=None,
+                    pullback_zone_high=None,
+                    reason="Range confirmed.",
+                )
+
+            def _detect_candidate(self, symbol, decision_timestamp, regime, *, setup_family=None, replay_bars=None):
+                return CandidateSnapshot(
+                    candidate_setup_present=True,
+                    setup_family="range_fade",
+                    direction="SHORT",
+                    entry_zone_low=70020,
+                    entry_zone_high=70040,
+                    invalidation_level=70100,
+                    target_reference=69900,
+                    reward_risk_estimate=2.0,
+                    reclaim_confirmed=True,
+                    reason="Range fade candidate confirmed.",
+                )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = DEFAULT_CONFIG.copy()
+            config["bot_state_path"] = str(Path(tmpdir) / "bot_state.json")
+            runner = ReplayRunner(
+                config=config,
+                bot_config=BotConfig(symbol="BTC-USD", timeframe="1h", analysis_interval_minutes=240, once=True),
+                executor=type("StubExecutor", (), {"cancel_order": lambda *args, **kwargs: {}})(),
+            )
+            result = runner.run_replay("2026-04-08 00:00", "2026-04-09 23:00", mode="candidate-only")
+
+            self.assertIn("range_fade", result["summary"]["by_strategy"])
+            self.assertGreater(result["summary"]["by_strategy"]["range_fade"]["total"], 0)
+
+    def test_quality_filter_rejects_range_fade_entry_outside_zone(self):
+        snapshot = ExchangeStateSnapshot(
+            wallet_address="0xabc",
+            equity=1000,
+            available_balance=1000,
+            mark_prices={"BTC": 70000},
+            positions=[],
+            open_orders=[],
+            fetched_at=datetime.now(timezone.utc).isoformat(),
+        )
+        regime = RegimeSnapshot(
+            label="range",
+            trade_allowed=True,
+            preferred_action="FLAT",
+            setup_family="range_fade",
+            allowed_setup_families=["range_fade"],
+            current_price=70000,
+            ema20=70000,
+            ema50=70005,
+            atr14=250,
+            atr_pct=0.0035,
+            ema20_slope_pct=0.0,
+            trend_spread_pct=0.0002,
+            realized_vol_24h=0.004,
+            bar_change_pct=0.0002,
+            pullback_distance_atr=0.1,
+            pullback_zone_low=None,
+            pullback_zone_high=None,
+            reason="Range confirmed.",
+        )
+        candidate = CandidateSnapshot(
+            candidate_setup_present=True,
+            setup_family="range_fade",
+            direction="SHORT",
+            entry_zone_low=70020,
+            entry_zone_high=70040,
+            invalidation_level=70100,
+            target_reference=69900,
+            reward_risk_estimate=2.0,
+            reclaim_confirmed=True,
+            reason="Range fade candidate confirmed.",
+        )
+        action, reasons = self.runner._apply_quality_filters(
+            {
+                "symbol": "BTC",
+                "action": "SHORT",
+                "entry_mode": "LIMIT",
+                "entry_price": 69900,
+                "stop_loss": 70100,
+                "take_profit": 69700,
+                "position_instruction": "OPEN",
+            },
+            snapshot,
+            regime,
+            candidate,
+        )
+
+        self.assertEqual(action["action"], "FLAT")
+        self.assertTrue(any("outside the allowed range_fade zone" in reason for reason in reasons))
+
     def test_sqlite_journal_records_live_cycle(self):
         class StubExecutor:
             def get_exchange_state_snapshot(self, symbol):
@@ -1026,16 +1161,17 @@ class BotRunnerPlannerTests(unittest.TestCase):
 
             with sqlite3.connect(journal_path) as conn:
                 row = conn.execute(
-                    "SELECT symbol, timeframe, regime_label, candidate_setup_present, outcome, final_action "
+                    "SELECT symbol, timeframe, regime_label, selected_setup_family, candidate_setup_present, outcome, final_action "
                     "FROM bot_cycle_journal ORDER BY id DESC LIMIT 1"
                 ).fetchone()
 
             self.assertEqual(row[0], "BTC")
             self.assertEqual(row[1], "1h")
             self.assertEqual(row[2], "trend_down")
-            self.assertEqual(row[3], 1)
-            self.assertEqual(row[4], "no_action")
-            self.assertEqual(row[5], "FLAT")
+            self.assertEqual(row[3], "trend_pullback")
+            self.assertEqual(row[4], 1)
+            self.assertEqual(row[5], "no_action")
+            self.assertEqual(row[6], "FLAT")
 
 
 if __name__ == "__main__":
