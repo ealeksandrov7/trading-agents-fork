@@ -1607,6 +1607,22 @@ def bot_replay(
         )
     console.print(strategy_table)
 
+    reason_table = Table(title="Top Skip Reasons", box=box.SIMPLE)
+    reason_table.add_column("Category")
+    reason_table.add_column("Reason")
+    reason_table.add_column("Count", justify="right")
+    for regime, reasons in summary.get("top_regime_reasons", {}).items():
+        for item in reasons[:2]:
+            reason_table.add_row(f"regime:{regime}", item["reason"], str(item["count"]))
+    for strategy_name, reasons in summary.get("top_candidate_reasons_by_strategy", {}).items():
+        for item in reasons[:2]:
+            reason_table.add_row(f"candidate:{strategy_name}", item["reason"], str(item["count"]))
+    for strategy_name, reasons in summary.get("top_quality_filter_reasons_by_strategy", {}).items():
+        for item in reasons[:2]:
+            reason_table.add_row(f"filter:{strategy_name}", item["reason"], str(item["count"]))
+    if reason_table.row_count:
+        console.print(reason_table)
+
     if output is not None:
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(result, indent=2))

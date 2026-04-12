@@ -157,6 +157,8 @@ Replay metrics currently include:
 - simulated trades vs no-trade
 - regime grouping
 - strategy grouping
+- top skip reasons by regime
+- top candidate and filter rejection reasons by strategy
 - `R_1`, `R_2`, `R_4`, `R_8`
 - `MAE` / `MFE`
 

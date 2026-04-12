@@ -71,6 +71,9 @@ def summarize_replay(observations: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "llm_evaluated": 0,
         "by_regime": {},
         "by_strategy": {},
+        "top_regime_reasons": {},
+        "top_candidate_reasons_by_strategy": {},
+        "top_quality_filter_reasons_by_strategy": {},
     }
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     by_strategy: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -95,6 +98,8 @@ def summarize_replay(observations: Iterable[dict[str, Any]]) -> dict[str, Any]:
             "avg_mfe_r": _average_metric(executed, "mfe_r"),
             "avg_mae_r": _average_metric(executed, "mae_r"),
         }
+        skipped = [item for item in items if not item.get("executed")]
+        summary["top_regime_reasons"][regime] = _top_reasons(skipped, "regime_reason")
     for strategy, items in by_strategy.items():
         executed = [item for item in items if item.get("executed")]
         summary["by_strategy"][strategy] = {
@@ -106,6 +111,9 @@ def summarize_replay(observations: Iterable[dict[str, Any]]) -> dict[str, Any]:
             "avg_mfe_r": _average_metric(executed, "mfe_r"),
             "avg_mae_r": _average_metric(executed, "mae_r"),
         }
+        skipped = [item for item in items if not item.get("executed")]
+        summary["top_candidate_reasons_by_strategy"][strategy] = _top_reasons(skipped, "candidate_reason")
+        summary["top_quality_filter_reasons_by_strategy"][strategy] = _top_list_reasons(skipped, "quality_filter_reasons")
     return summary
 
 
@@ -201,3 +209,28 @@ def _average_metric(items: list[dict[str, Any]], key: str) -> Optional[float]:
     if not values:
         return None
     return sum(values) / len(values)
+
+
+def _top_reasons(items: list[dict[str, Any]], key: str, *, limit: int = 3) -> list[dict[str, Any]]:
+    counts: dict[str, int] = defaultdict(int)
+    for item in items:
+        reason = str(item.get(key) or "").strip()
+        if reason:
+            counts[reason] += 1
+    return [
+        {"reason": reason, "count": count}
+        for reason, count in sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))[:limit]
+    ]
+
+
+def _top_list_reasons(items: list[dict[str, Any]], key: str, *, limit: int = 3) -> list[dict[str, Any]]:
+    counts: dict[str, int] = defaultdict(int)
+    for item in items:
+        for reason in item.get(key) or []:
+            text = str(reason).strip()
+            if text:
+                counts[text] += 1
+    return [
+        {"reason": reason, "count": count}
+        for reason, count in sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))[:limit]
+    ]

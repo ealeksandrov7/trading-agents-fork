@@ -1321,6 +1321,7 @@ class BotRunner:
             "setup_family": candidate.setup_family or regime.setup_family,
             "regime_label": regime.label,
             "regime_trade_allowed": regime.trade_allowed,
+            "regime_reason": regime.reason,
             "candidate_setup_present": candidate.candidate_setup_present,
             "candidate_reason": candidate.reason,
             "quality_filter_reasons": quality_filter_reasons,

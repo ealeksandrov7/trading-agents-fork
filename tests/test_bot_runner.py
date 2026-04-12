@@ -1042,6 +1042,49 @@ class BotRunnerPlannerTests(unittest.TestCase):
 
             self.assertIn("range_fade", result["summary"]["by_strategy"])
             self.assertGreater(result["summary"]["by_strategy"]["range_fade"]["total"], 0)
+            self.assertIn("range", result["summary"]["top_regime_reasons"])
+            self.assertIn("range_fade", result["summary"]["top_candidate_reasons_by_strategy"])
+
+    def test_replay_summary_includes_reason_breakdowns(self):
+        observations = [
+            {
+                "regime_label": "low_quality",
+                "regime_reason": "Market structure is ambiguous.",
+                "setup_family": "none",
+                "candidate_reason": "No strategy is eligible.",
+                "quality_filter_reasons": [],
+                "executed": False,
+                "llm_evaluated": False,
+            },
+            {
+                "regime_label": "low_quality",
+                "regime_reason": "Market structure is ambiguous.",
+                "setup_family": "none",
+                "candidate_reason": "No strategy is eligible.",
+                "quality_filter_reasons": [],
+                "executed": False,
+                "llm_evaluated": False,
+            },
+            {
+                "regime_label": "range",
+                "regime_reason": "Range confirmed.",
+                "setup_family": "range_fade",
+                "candidate_reason": "Price is not near a range edge.",
+                "quality_filter_reasons": ["planned entry is outside the allowed range_fade zone"],
+                "executed": False,
+                "llm_evaluated": False,
+            },
+        ]
+
+        from tradingagents.bot.replay import summarize_replay
+
+        summary = summarize_replay(observations)
+        self.assertEqual(summary["top_regime_reasons"]["low_quality"][0]["count"], 2)
+        self.assertEqual(summary["top_candidate_reasons_by_strategy"]["range_fade"][0]["reason"], "Price is not near a range edge.")
+        self.assertEqual(
+            summary["top_quality_filter_reasons_by_strategy"]["range_fade"][0]["reason"],
+            "planned entry is outside the allowed range_fade zone",
+        )
 
     def test_quality_filter_rejects_range_fade_entry_outside_zone(self):
         snapshot = ExchangeStateSnapshot(
