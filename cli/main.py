@@ -38,6 +38,11 @@ from tradingagents.execution import (
     RiskEngine,
     RiskEvaluationError,
 )
+from tradingagents.research import (
+    BacktestingUnavailableError,
+    optimize_backtesting_strategy,
+    run_backtesting_strategy,
+)
 from cli.models import AnalystType
 from cli.utils import *
 from cli.announcements import fetch_announcements, display_announcements
@@ -1535,12 +1540,14 @@ def bot_replay(
     config["decision_timeframe"] = timeframe
     config["hyperliquid_testnet"] = testnet
     config["bot_analysis_interval_minutes"] = analysis_interval_minutes
-    executor = HyperliquidExecutor(
-        wallet_address=config.get("hyperliquid_wallet_address"),
-        private_key=config.get("hyperliquid_private_key"),
-        base_url=config.get("hyperliquid_base_url"),
-        testnet=testnet,
-    )
+    executor = None
+    if source == "hyperliquid":
+        executor = HyperliquidExecutor(
+            wallet_address=config.get("hyperliquid_wallet_address"),
+            private_key=config.get("hyperliquid_private_key"),
+            base_url=config.get("hyperliquid_base_url"),
+            testnet=testnet,
+        )
     bot_runner = BotRunner(
         config=config,
         bot_config=BotConfig(
@@ -1649,6 +1656,186 @@ def bot_replay(
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(result, indent=2))
         console.print(f"[green]Replay written to[/green] {output.resolve()}")
+
+
+@app.command("backtest-strategy")
+def backtest_strategy(
+    symbol: str = typer.Option("BTC-USD", "--symbol", help="Instrument to backtest."),
+    timeframe: str = typer.Option("1h", "--timeframe", help="Backtest timeframe."),
+    strategy: str = typer.Option(..., "--strategy", help="Deterministic strategy to backtest: trend_pullback or range_fade."),
+    start: str = typer.Option(..., "--start", help="Backtest start timestamp, e.g. 2026-04-01 00:00."),
+    end: str = typer.Option(..., "--end", help="Backtest end timestamp, e.g. 2026-04-30 23:00."),
+    analysis_interval_minutes: int = typer.Option(60, "--analysis-interval-minutes", help="How often to evaluate deterministic setup logic."),
+    data_source: str = typer.Option("vendor", "--data-source", help="Historical data source: vendor or hyperliquid."),
+    cash: float = typer.Option(10_000.0, "--cash", help="Initial capital for the backtest."),
+    commission: float = typer.Option(0.0, "--commission", help="Flat commission rate passed to backtesting.py."),
+    optimize: bool = typer.Option(False, "--optimize", help="Run a deterministic parameter sweep instead of a single backtest."),
+    maximize: str = typer.Option("Return [%]", "--maximize", help="Metric used to rank optimization runs."),
+    target_r_values: Optional[str] = typer.Option(None, "--target-r-values", help="Comma-separated target R values for optimization."),
+    expiry_values: Optional[str] = typer.Option(None, "--expiry-values", help="Comma-separated setup expiry bar counts for optimization."),
+    entry_style_values: Optional[str] = typer.Option(None, "--entry-style-values", help="Comma-separated trend_pullback entry styles: midpoint, near_price, deep_pullback."),
+    target_mode_values: Optional[str] = typer.Option(None, "--target-mode-values", help="Comma-separated range_fade target modes: reference, fixed_r."),
+    testnet: bool = typer.Option(True, "--testnet/--mainnet", help="Use Hyperliquid testnet for native candle backtests."),
+    output: Optional[Path] = typer.Option(None, "--output", help="Optional path to write full backtest JSON."),
+):
+    source = data_source.strip().lower()
+    if source not in {"vendor", "hyperliquid"}:
+        raise typer.BadParameter("data_source must be one of: vendor, hyperliquid")
+    selected_strategy = strategy.strip().lower()
+    if selected_strategy not in {"trend_pullback", "range_fade"}:
+        raise typer.BadParameter("strategy must be one of: trend_pullback, range_fade")
+
+    config = DEFAULT_CONFIG.copy()
+    config["analysis_timeframe"] = timeframe
+    config["decision_timeframe"] = timeframe
+    config["hyperliquid_testnet"] = testnet
+    config["bot_analysis_interval_minutes"] = analysis_interval_minutes
+    executor = HyperliquidExecutor(
+        wallet_address=config.get("hyperliquid_wallet_address"),
+        private_key=config.get("hyperliquid_private_key"),
+        base_url=config.get("hyperliquid_base_url"),
+        testnet=testnet,
+    )
+
+    parameter_grid = {}
+    if target_r_values:
+        parameter_grid["target_r"] = _parse_float_list(target_r_values, "target-r-values")
+    if expiry_values:
+        parameter_grid["expiry_bars"] = _parse_int_list(expiry_values, "expiry-values")
+    if entry_style_values:
+        parameter_grid["entry_style"] = _parse_str_list(entry_style_values)
+    if target_mode_values:
+        parameter_grid["target_mode"] = _parse_str_list(target_mode_values)
+
+    try:
+        if optimize:
+            optimization = optimize_backtesting_strategy(
+                symbol=symbol,
+                timeframe=timeframe,
+                start_timestamp=start,
+                end_timestamp=end,
+                strategy_name=selected_strategy,
+                data_source=source,
+                config=config,
+                executor=executor,
+                analysis_interval_minutes=analysis_interval_minutes,
+                testnet=testnet,
+                cash=cash,
+                commission=commission,
+                maximize=maximize,
+                parameter_grid=parameter_grid or None,
+            )
+            best_result = optimization["best_result"]
+            if best_result is None:
+                console.print("[red]Optimization produced no completed runs.[/red]")
+                raise typer.Exit(code=1)
+            result = best_result
+        else:
+            result = run_backtesting_strategy(
+                symbol=symbol,
+                timeframe=timeframe,
+                start_timestamp=start,
+                end_timestamp=end,
+                strategy_name=selected_strategy,
+                data_source=source,
+                config=config,
+                executor=executor,
+                analysis_interval_minutes=analysis_interval_minutes,
+                testnet=testnet,
+                cash=cash,
+                commission=commission,
+            )
+    except BacktestingUnavailableError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    summary = result["prepared_summary"]
+    stats = result["stats"]
+
+    table = Table(title=f"Strategy Backtest: {symbol} {timeframe}", box=box.SIMPLE)
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    table.add_row("Strategy", result["strategy_name"])
+    table.add_row("Data source", result["data_source"])
+    table.add_row("Cash", f"{result['cash']:.2f}")
+    table.add_row("Commission", f"{result['commission']:.4f}")
+    table.add_row("Bars", str(summary["bars"]))
+    table.add_row("Analysis bars", str(summary["analysis_bars"]))
+    table.add_row("Candidate bars", str(summary["candidate_bars"]))
+    table.add_row("Deterministic actions", str(summary["deterministic_actions"]))
+    table.add_row("HTF filter", "enabled" if summary["higher_timeframe_filter_enabled"] else "disabled")
+    console.print(table)
+
+    if optimize:
+        optimization_table = Table(title="Optimization Summary", box=box.SIMPLE)
+        optimization_table.add_column("Metric")
+        optimization_table.add_column("Value", justify="right")
+        optimization_table.add_row("Maximize", maximize)
+        optimization_table.add_row("Runs", str(optimization["evaluated"]))
+        optimization_table.add_row("Best params", json.dumps(optimization["ranked_results"][0]["params"]))
+        console.print(optimization_table)
+
+        top_runs = Table(title="Top Optimization Runs", box=box.SIMPLE)
+        top_runs.add_column("Params")
+        top_runs.add_column(maximize, justify="right")
+        top_runs.add_column("Return %", justify="right")
+        top_runs.add_column("# Trades", justify="right")
+        top_runs.add_column("Win Rate %", justify="right")
+        for item in optimization["ranked_results"][:5]:
+            top_runs.add_row(
+                json.dumps(item["params"]),
+                "-" if item["score"] is None else f"{item['score']:.2f}",
+                "-" if item["return_pct"] is None else f"{item['return_pct']:.2f}",
+                "-" if item["trades"] is None else f"{item['trades']:.0f}",
+                "-" if item["win_rate_pct"] is None else f"{item['win_rate_pct']:.2f}",
+            )
+        console.print(top_runs)
+
+    stats_table = Table(title="Backtesting.py Stats", box=box.SIMPLE)
+    stats_table.add_column("Metric")
+    stats_table.add_column("Value", justify="right")
+    for key in [
+        "Return [%]",
+        "Buy & Hold Return [%]",
+        "# Trades",
+        "Win Rate [%]",
+        "Profit Factor",
+        "Sharpe Ratio",
+        "Max. Drawdown [%]",
+        "Expectancy [%]",
+    ]:
+        value = stats.get(key)
+        if value is None:
+            continue
+        if isinstance(value, float):
+            stats_table.add_row(key, f"{value:.2f}")
+        else:
+            stats_table.add_row(key, str(value))
+    console.print(stats_table)
+
+    if output is not None:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        payload = optimization if optimize else result
+        output.write_text(json.dumps(payload, indent=2))
+        console.print(f"[green]Backtest written to[/green] {output.resolve()}")
+
+
+def _parse_float_list(raw: str, option_name: str) -> list[float]:
+    try:
+        return [float(item.strip()) for item in raw.split(",") if item.strip()]
+    except ValueError as exc:
+        raise typer.BadParameter(f"{option_name} must contain comma-separated numbers") from exc
+
+
+def _parse_int_list(raw: str, option_name: str) -> list[int]:
+    try:
+        return [int(item.strip()) for item in raw.split(",") if item.strip()]
+    except ValueError as exc:
+        raise typer.BadParameter(f"{option_name} must contain comma-separated integers") from exc
+
+
+def _parse_str_list(raw: str) -> list[str]:
+    return [item.strip().lower() for item in raw.split(",") if item.strip()]
 
 
 if __name__ == "__main__":

@@ -20,6 +20,8 @@ def create_market_analyst(llm):
         setup_family = state.get("setup_family", "trend_pullback")
         allowed_setup_families = state.get("allowed_setup_families", []) or []
         regime_context = state.get("regime_context", {}) or {}
+        higher_timeframe_summary = state.get("higher_timeframe_summary", "")
+        higher_timeframe_context = state.get("higher_timeframe_context", {}) or {}
         candidate_summary = state.get("candidate_summary", "")
         candidate_context = state.get("candidate_context", {}) or {}
         intraday_instruction = ""
@@ -47,6 +49,9 @@ Allowed strategy families for this regime: **{', '.join(allowed_setup_families) 
 Deterministic regime gate:
 - {regime_summary or 'No regime summary provided.'}
 - The regime payload says trade_allowed={str(trade_allowed).lower()} and preferred_action={preferred_action}.
+- Higher timeframe trend filter:
+- {higher_timeframe_summary or 'No higher-timeframe summary provided.'}
+- The higher-timeframe payload says label={higher_timeframe_context.get("label", "neutral")} and preferred_action={higher_timeframe_context.get("preferred_action", "FLAT")}.
 - Deterministic setup candidate:
 - {candidate_summary or 'No candidate summary provided.'}
 - The candidate payload says candidate_setup_present={str(bool(candidate_context.get("candidate_setup_present"))).lower()} and direction={candidate_context.get("direction", preferred_action)}.
@@ -96,7 +101,8 @@ Volume-Based Indicators:
         else:
             system_message += (
                 "\nFor trend_pullback specifically: validate continuation with a pullback into the allowed zone, "
-                "prefer reclaim/continuation evidence, and do not chase extension bars far from the pullback zone."
+                "prefer reclaim/continuation evidence, do not chase extension bars far from the pullback zone, "
+                "and require alignment with the higher-timeframe trend filter."
             )
 
         prompt = ChatPromptTemplate.from_messages(

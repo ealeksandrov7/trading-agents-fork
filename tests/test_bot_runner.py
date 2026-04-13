@@ -9,7 +9,7 @@ from langchain_core.messages import ToolMessage
 
 from tradingagents.bot.candidate import CandidateSnapshot
 from tradingagents.bot.models import BotConfig, BotState
-from tradingagents.bot.regime import RegimeSnapshot
+from tradingagents.bot.regime import HigherTimeframeTrendSnapshot, RegimeSnapshot
 from tradingagents.bot.runner import BotRunner
 from tradingagents.bot.state import BotStateStore
 from tradingagents.default_config import DEFAULT_CONFIG
@@ -69,6 +69,22 @@ class BotRunnerPlannerTests(unittest.TestCase):
             pullback_zone_low=69950,
             pullback_zone_high=70350,
             reason="Downtrend confirmed.",
+        )
+
+    @staticmethod
+    def _aligned_higher_timeframe(direction: str = "SHORT"):
+        label = "trend_down" if direction == "SHORT" else "trend_up"
+        preferred_action = direction
+        return HigherTimeframeTrendSnapshot(
+            timeframe="4h",
+            label=label,
+            preferred_action=preferred_action,
+            current_price=70000,
+            ema20=69900 if direction == "LONG" else 70100,
+            ema50=69200 if direction == "LONG" else 70600,
+            ema20_slope_pct=0.003 if direction == "LONG" else -0.003,
+            trend_spread_pct=0.01,
+            reason=f"4h {label} confirmed.",
         )
 
     @staticmethod
@@ -233,6 +249,9 @@ class BotRunnerPlannerTests(unittest.TestCase):
             def _classify_regime(self, symbol, decision_timestamp):
                 return BotRunnerPlannerTests._tradable_regime()
 
+            def _classify_higher_timeframe_trend(self, symbol, decision_timestamp, *, replay_bars=None):
+                return BotRunnerPlannerTests._aligned_higher_timeframe("SHORT")
+
             def _detect_candidate(self, symbol, decision_timestamp, regime, *, replay_bars=None):
                 return BotRunnerPlannerTests._positive_candidate("SHORT")
 
@@ -309,6 +328,9 @@ class BotRunnerPlannerTests(unittest.TestCase):
             def _classify_regime(self, symbol, decision_timestamp):
                 return BotRunnerPlannerTests._tradable_regime()
 
+            def _classify_higher_timeframe_trend(self, symbol, decision_timestamp, *, replay_bars=None):
+                return BotRunnerPlannerTests._aligned_higher_timeframe("SHORT")
+
             def _detect_candidate(self, symbol, decision_timestamp, regime, *, replay_bars=None):
                 return BotRunnerPlannerTests._positive_candidate("SHORT")
 
@@ -378,6 +400,9 @@ class BotRunnerPlannerTests(unittest.TestCase):
 
             def _classify_regime(self, symbol, decision_timestamp):
                 return BotRunnerPlannerTests._tradable_regime()
+
+            def _classify_higher_timeframe_trend(self, symbol, decision_timestamp, *, replay_bars=None):
+                return BotRunnerPlannerTests._aligned_higher_timeframe("SHORT")
 
             def _detect_candidate(self, symbol, decision_timestamp, regime, *, replay_bars=None):
                 return BotRunnerPlannerTests._positive_candidate("SHORT")
@@ -472,6 +497,9 @@ class BotRunnerPlannerTests(unittest.TestCase):
                     reason="Trend spread and slope are too weak.",
                 )
 
+            def _classify_higher_timeframe_trend(self, symbol, decision_timestamp, *, replay_bars=None):
+                return BotRunnerPlannerTests._aligned_higher_timeframe("LONG")
+
             def _run_decision(self, state, snapshot, decision_timestamp):
                 raise AssertionError("graph should not run when regime is blocked")
 
@@ -543,6 +571,9 @@ class BotRunnerPlannerTests(unittest.TestCase):
                     pullback_zone_high=70040,
                     reason="Uptrend confirmed.",
                 )
+
+            def _classify_higher_timeframe_trend(self, symbol, decision_timestamp, *, replay_bars=None):
+                return BotRunnerPlannerTests._aligned_higher_timeframe("LONG")
 
             def _detect_candidate(self, symbol, decision_timestamp, regime, *, replay_bars=None):
                 return BotRunnerPlannerTests._positive_candidate("LONG")
@@ -633,6 +664,9 @@ class BotRunnerPlannerTests(unittest.TestCase):
                     reason="Uptrend confirmed.",
                 )
 
+            def _classify_higher_timeframe_trend(self, symbol, decision_timestamp, *, replay_bars=None):
+                return BotRunnerPlannerTests._aligned_higher_timeframe("LONG")
+
             def _detect_candidate(self, symbol, decision_timestamp, regime, *, replay_bars=None):
                 return CandidateSnapshot(
                     candidate_setup_present=True,
@@ -681,6 +715,71 @@ class BotRunnerPlannerTests(unittest.TestCase):
             candidate_events = [event for event in events if event.event_type == "candidate"]
             self.assertEqual(len(candidate_events), 1)
 
+    def test_higher_timeframe_misalignment_blocks_trend_pullback(self):
+        class StubExecutor:
+            def get_exchange_state_snapshot(self, symbol):
+                return ExchangeStateSnapshot(
+                    wallet_address="0xabc",
+                    equity=1000,
+                    available_balance=1000,
+                    spot_usdc_balance=1000,
+                    mark_prices={"BTC": 70000},
+                    positions=[],
+                    open_orders=[],
+                    fetched_at=datetime.now(timezone.utc).isoformat(),
+                )
+
+            def cancel_order(self, symbol, order_id):
+                return {"status": "ok"}
+
+        class FixedRunner(BotRunner):
+            def _latest_analysis_bar(self):
+                return "2026-04-07 12:00"
+
+            def _classify_regime(self, symbol, decision_timestamp):
+                return RegimeSnapshot(
+                    label="trend_up",
+                    trade_allowed=True,
+                    preferred_action="LONG",
+                    setup_family="trend_pullback",
+                    allowed_setup_families=["trend_pullback"],
+                    current_price=70000,
+                    ema20=69900,
+                    ema50=69200,
+                    atr14=400,
+                    atr_pct=0.0057,
+                    ema20_slope_pct=0.003,
+                    trend_spread_pct=0.01,
+                    realized_vol_24h=0.008,
+                    bar_change_pct=0.001,
+                    pullback_distance_atr=0.25,
+                    pullback_zone_low=69600,
+                    pullback_zone_high=70040,
+                    reason="Uptrend confirmed.",
+                )
+
+            def _classify_higher_timeframe_trend(self, symbol, decision_timestamp, *, replay_bars=None):
+                return BotRunnerPlannerTests._aligned_higher_timeframe("SHORT")
+
+            def _run_decision(self, state, snapshot, decision_timestamp):
+                raise AssertionError("graph should not run when higher timeframe is misaligned")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = DEFAULT_CONFIG.copy()
+            config["bot_state_path"] = str(Path(tmpdir) / "bot_state.json")
+            runner = FixedRunner(
+                config=config,
+                bot_config=BotConfig(symbol="BTC-USD", timeframe="1h", once=True),
+                executor=StubExecutor(),
+            )
+
+            runner.run_once()
+
+            state, _ = BotStateStore(Path(config["bot_state_path"])).load()
+            self.assertEqual(state.last_decision_action["action"], "FLAT")
+            self.assertEqual(state.higher_timeframe_snapshot["label"], "trend_down")
+            self.assertIn("Blocked by higher timeframe filter", state.regime_snapshot["reason"])
+
     def test_run_replay_returns_summary(self):
         class ReplayRunner(BotRunner):
             def _load_replay_bars(self, symbol, start_timestamp, end_timestamp, *, data_source="vendor"):
@@ -723,6 +822,9 @@ class BotRunnerPlannerTests(unittest.TestCase):
                     pullback_zone_high=71000,
                     reason="Uptrend confirmed.",
                 )
+
+            def _classify_higher_timeframe_trend(self, symbol, decision_timestamp, *, replay_bars=None):
+                return BotRunnerPlannerTests._aligned_higher_timeframe("LONG")
 
             def _detect_candidate(self, symbol, decision_timestamp, regime, *, replay_bars=None):
                 return CandidateSnapshot(
@@ -817,6 +919,9 @@ class BotRunnerPlannerTests(unittest.TestCase):
                     pullback_zone_high=71000,
                     reason="Uptrend confirmed.",
                 )
+
+            def _classify_higher_timeframe_trend(self, symbol, decision_timestamp, *, replay_bars=None):
+                return BotRunnerPlannerTests._aligned_higher_timeframe("LONG")
 
             def _run_decision(self, state, snapshot, decision_timestamp):
                 return {
@@ -1123,6 +1228,9 @@ class BotRunnerPlannerTests(unittest.TestCase):
                     reason="Uptrend confirmed.",
                 )
 
+            def _classify_higher_timeframe_trend(self, symbol, decision_timestamp, *, replay_bars=None):
+                return BotRunnerPlannerTests._aligned_higher_timeframe("LONG")
+
             def _detect_candidate(self, symbol, decision_timestamp, regime, *, setup_family=None, replay_bars=None):
                 return CandidateSnapshot(
                     candidate_setup_present=True,
@@ -1330,6 +1438,9 @@ class BotRunnerPlannerTests(unittest.TestCase):
 
             def _classify_regime(self, symbol, decision_timestamp):
                 return BotRunnerPlannerTests._tradable_regime()
+
+            def _classify_higher_timeframe_trend(self, symbol, decision_timestamp, *, replay_bars=None):
+                return BotRunnerPlannerTests._aligned_higher_timeframe("SHORT")
 
             def _detect_candidate(self, symbol, decision_timestamp, regime, *, replay_bars=None):
                 return BotRunnerPlannerTests._positive_candidate("SHORT")

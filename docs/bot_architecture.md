@@ -8,6 +8,7 @@ The bot is currently optimized for a narrow, measurable first live strategy:
 
 - Market: `BTC-USD`
 - Timeframe: `1h`
+- Higher-timeframe anchor for `trend_pullback`: `4h`
 - Strategy families: `trend_pullback`, `range_fade`
 - Execution venue: Hyperliquid
 - Design goal: deterministic regime routing first, LLM refinement second, deterministic execution validation last
@@ -22,17 +23,19 @@ For each eligible analysis bar, the flow is:
 
 1. Sync exchange state from Hyperliquid.
 2. Run deterministic regime classification.
-3. Route the active regime to its allowed strategy family.
-4. Run deterministic setup candidate detection for the routed strategy.
-5. If any deterministic gate fails, return synthetic `FLAT/NO_ACTION` without invoking the graph.
-6. If the routed strategy produces a valid candidate, invoke the LLM graph.
-7. Parse the structured trade decision.
-8. Apply deterministic post-parse quality filters.
-9. If the decision still passes, convert it into an order intent and execute.
+3. Run deterministic higher-timeframe trend classification.
+4. Apply the higher-timeframe filter to `trend_pullback`.
+5. Route the active regime to its allowed strategy family.
+6. Run deterministic setup candidate detection for the routed strategy.
+7. If any deterministic gate fails, return synthetic `FLAT/NO_ACTION` without invoking the graph.
+8. If the routed strategy produces a valid candidate, invoke the LLM graph.
+9. Parse the structured trade decision.
+10. Apply deterministic post-parse quality filters.
+11. If the decision still passes, convert it into an order intent and execute.
 
 The intended shape is:
 
-`market data -> regime gate -> strategy router -> candidate gate -> LLM graph -> quality filter -> execution`
+`market data -> 1h regime gate -> 4h trend filter -> strategy router -> candidate gate -> LLM graph -> quality filter -> execution`
 
 ## Deterministic Gates
 
@@ -54,12 +57,34 @@ Current labels:
 
 Current routing behavior:
 
-- `trend_up` -> `trend_pullback`
-- `trend_down` -> `trend_pullback`
+- `trend_up` -> `trend_pullback` only if aligned with `4h trend_up`
+- `trend_down` -> `trend_pullback` only if aligned with `4h trend_down`
 - `range` -> `range_fade`
 - `high_volatility_event` / `low_quality` -> hard skip
 
 The regime gate derives EMA structure, ATR-based volatility, slope, spread, and pullback-zone metadata.
+
+### 1b. Higher-Timeframe Trend Filter
+
+Also implemented in [tradingagents/bot/regime.py](/Users/evlogialeksandrov/repos/TradingAgents/tradingagents/bot/regime.py).
+
+Current higher-timeframe behavior:
+
+- anchor timeframe: `4h`
+- labels:
+  - `trend_up`
+  - `trend_down`
+  - `neutral`
+
+Current use:
+
+- `trend_pullback` is only allowed when `1h` and `4h` trend direction agree
+- `range_fade` remains based on the `1h range` regime only
+
+This makes `trend_pullback` a classical multi-timeframe setup:
+
+- `4h` determines the primary trend direction
+- `1h` determines whether there is a tactical pullback entry in that direction
 
 ### 2. Candidate Gate
 
@@ -75,6 +100,7 @@ Current supported candidate detectors:
 
 - `trend_pullback`
   - regime must already route to trend continuation
+  - higher-timeframe trend must align with the `1h` direction
   - recent bars must retrace into the allowed pullback zone
   - reclaim/continuation confirmation must exist
   - an invalidation level must be derivable
@@ -104,6 +130,8 @@ The graph is now prompt-constrained by:
 
 - regime summary
 - regime payload
+- higher-timeframe summary
+- higher-timeframe payload
 - allowed setup families
 - candidate summary
 - candidate payload
@@ -149,6 +177,7 @@ Hyperliquid historical candle retrieval is implemented in [tradingagents/executi
 Important replay detail:
 
 - replay regime classification uses the replay bars directly
+- replay higher-timeframe alignment is derived from the same replay bars via `4h` resampling
 - it does not re-fetch a separate market stream for classification
 - `candidate-only` replay evaluates deterministic candidates without invoking the graph
 - `deterministic-only` replay converts deterministic candidates into fully specified rule-based actions without invoking the graph
@@ -190,6 +219,61 @@ Replay diagnostics are meant to answer three different questions:
 - `deterministic-only`: what happens if the bot trades the strategy rules directly with no LLM screening?
 - `full-llm`: how does the full bot behave after deterministic routing and gating?
 
+## `backtesting.py` Research Harness
+
+The repo now also has a separate deterministic research harness built on top of `backtesting.py`.
+
+Implementation:
+
+- [tradingagents/research/backtesting_harness.py](/Users/evlogialeksandrov/repos/TradingAgents/tradingagents/research/backtesting_harness.py)
+- CLI entry point in [cli/main.py](/Users/evlogialeksandrov/repos/TradingAgents/cli/main.py) via `backtest-strategy`
+
+Purpose:
+
+- run classical deterministic backtests for the current strategies
+- keep live bot orchestration and LLM behavior out of the test loop
+- benchmark whether the LLM layer is actually adding value versus pure rules
+
+Current supported strategies:
+
+- `trend_pullback`
+- `range_fade`
+
+Current harness behavior:
+
+- loads OHLCV from the same repo data sources as replay:
+  - `vendor`
+  - `hyperliquid`
+- precomputes deterministic regime, higher-timeframe alignment, candidates, and deterministic actions from the bot's own logic
+- hands those precomputed actions to `backtesting.py` for order simulation
+- uses one asset per backtest run
+- supports manual parameter sweeps by rebuilding the deterministic frame for each tested config combination
+
+Important distinction:
+
+- `bot-replay` measures the bot pipeline
+- `backtest-strategy` measures deterministic strategy behavior
+
+Use `bot-replay` when you need:
+
+- regime/candidate diagnostics
+- LLM-vs-deterministic comparison
+- bot-specific skip reasons
+
+Use `backtest-strategy` when you need:
+
+- standard backtest statistics
+- cleaner deterministic strategy benchmarking
+- parameter sweeps across deterministic trade specs
+
+Current limitations:
+
+- research-only; it does not drive live trading
+- single-asset per run
+- candle-level order simulation, not Hyperliquid microstructure simulation
+- depends on the optional `backtesting.py` package being installed locally
+- `backtesting.py` is AGPL-licensed; keep that visible when deciding how to use or distribute this path
+
 ### How To Read Replay Output
 
 The replay CLI currently prints several tables. They should be interpreted as follows:
@@ -221,6 +305,7 @@ Practical guidance:
 
 - If `range_fade` counts are low, first inspect `By Regime` and `Top Skip Reasons` before changing range-fade rules.
 - If `low_quality` is large, use `Regime Behavior` before loosening thresholds. Do not force more `range` labels without evidence.
+- If `trend_pullback` counts drop after this change, inspect higher-timeframe misalignment before loosening `1h` pullback logic.
 - If `candidate-only` looks promising but `full-llm` degrades, the issue is likely prompt or post-parse behavior rather than regime classification.
 - If `deterministic-only` matches or beats `full-llm`, the LLM is not currently earning its place in the entry path.
 
@@ -230,7 +315,11 @@ The deterministic replay baseline is intentionally simple. It is meant to benchm
 
 ### trend_pullback deterministic spec
 
-- entry: candidate zone midpoint via `LIMIT_ZONE`
+- entry: deterministic limit entry derived from the candidate zone
+- configurable entry style:
+  - `midpoint`
+  - `near_price`
+  - `deep_pullback`
 - stop: candidate invalidation level
 - target: fixed `R` multiple from entry
 - expiry: strategy-specific configurable bar count
@@ -239,6 +328,7 @@ Current defaults:
 
 - `bot_deterministic_trend_pullback_target_r_multiple = 2.0`
 - `bot_deterministic_trend_pullback_expiry_bars = 5`
+- `bot_deterministic_trend_pullback_entry_style = "midpoint"`
 
 ### range_fade deterministic spec
 
@@ -259,6 +349,8 @@ Purpose of these rules:
 - make strategy comparison fast and reproducible
 - measure whether the LLM layer improves actual outcomes enough to justify its cost and variance
 
+The same deterministic action specs are also used by the `backtesting.py` harness so the research baseline stays aligned with replay.
+
 ## State and Diagnostics
 
 Bot runtime state is stored via:
@@ -269,6 +361,7 @@ Bot runtime state is stored via:
 Relevant persisted fields:
 
 - `regime_snapshot`
+- `higher_timeframe_snapshot`
 - `candidate_snapshot`
 - `last_decision_diagnostics`
 - exchange/order/position state
@@ -278,6 +371,7 @@ Runtime graph state now also carries:
 - `allowed_setup_families`
 - routed `setup_family`
 - regime summary/context
+- higher-timeframe summary/context
 - candidate summary/context
 
 Current event log types now include deterministic gate outputs such as:
@@ -310,6 +404,7 @@ Each row currently stores:
 - decision timestamp
 - analysis timestamp
 - regime label and regime payload
+- higher-timeframe trend payload
 - allowed strategy families and selected strategy family
 - candidate direction and candidate payload
 - raw action payload
@@ -326,6 +421,7 @@ The journal is currently written for live bot cycles. Replay still returns in-me
 The journal schema is migration-safe for the current additions:
 
 - `allowed_setup_families`
+- `higher_timeframe_snapshot`
 - `selected_setup_family`
 
 ## Config Defaults That Matter
@@ -336,6 +432,8 @@ Key bot-specific defaults:
 
 - `bot_enabled_strategy_families = ["trend_pullback", "range_fade"]`
 - `bot_regime_strategy_map = {"trend_up": ["trend_pullback"], "trend_down": ["trend_pullback"], "range": ["range_fade"]}`
+- `bot_higher_timeframe_filter_enabled = True`
+- `bot_higher_timeframe_anchor_timeframe = "4h"`
 - `bot_min_reward_risk = 1.8`
 - `bot_journal_path = "./results/bot_journal.sqlite"`
 - regime thresholds for spread/slope/volatility
@@ -353,11 +451,18 @@ Current practical interpretation of the regime taxonomy:
 - `high_volatility_event`: hard no-trade due to event-style instability
 - `low_quality`: ambiguous or transitional structure; intentionally not forced into range or trend
 
+Current practical interpretation of `trend_pullback`:
+
+- `4h` must already be trending in the intended direction
+- `1h` must show a local pullback inside that larger directional context
+- if the `1h` and `4h` disagree, the bot stands aside
+
 ## Known Current Constraints
 
 - v1 logic is intentionally optimized for `BTC 1h`
 - replay can still hit LLM-provider auth issues if bars pass deterministic gates and the configured provider credentials are invalid
 - the graph still contains debate/research stages, but deterministic gates now prevent most unnecessary LLM calls
+- the `backtesting.py` harness is optional and will fail cleanly if the package is not installed in the active environment
 
 ## Recommended Future Extensions
 
@@ -382,8 +487,8 @@ Definition:
 
 In practical terms:
 
-- `LONG`: buy pullbacks in `trend_up`
-- `SHORT`: short rallies in `trend_down`
+- `LONG`: buy pullbacks in `1h trend_up` only when `4h trend_up` agrees
+- `SHORT`: short rallies in `1h trend_down` only when `4h trend_down` agrees
 
 Why this strategy was chosen first:
 
@@ -395,6 +500,7 @@ Why this strategy was chosen first:
 Known weaknesses:
 
 - undertrades when markets trend without retracing
+- undertrades further if the `4h` alignment filter is too strict
 - performs poorly in chop if regime classification is weak
 - can become too sparse if pullback-zone or reclaim rules are too strict
 
@@ -498,6 +604,43 @@ python cli/main.py bot-replay \
   --data-source hyperliquid \
   --analysis-interval-minutes 60 \
   --mode candidate-only \
+  --testnet
+```
+
+Deterministic strategy backtest with `backtesting.py`:
+
+```bash
+python cli/main.py backtest-strategy \
+  --symbol BTC-USD \
+  --timeframe 1h \
+  --strategy trend_pullback \
+  --start "2026-03-01 00:00" \
+  --end "2026-04-11 23:00" \
+  --data-source hyperliquid \
+  --analysis-interval-minutes 60 \
+  --cash 10000 \
+  --commission 0.0005 \
+  --testnet
+```
+
+Deterministic parameter sweep:
+
+```bash
+python cli/main.py backtest-strategy \
+  --symbol BTC-USD \
+  --timeframe 1h \
+  --strategy trend_pullback \
+  --start "2026-03-01 00:00" \
+  --end "2026-04-11 23:00" \
+  --data-source hyperliquid \
+  --analysis-interval-minutes 60 \
+  --cash 10000 \
+  --commission 0.0005 \
+  --optimize \
+  --maximize "Return [%]" \
+  --target-r-values 1.0,1.5,2.0 \
+  --expiry-values 3,5,7,9 \
+  --entry-style-values midpoint,near_price,deep_pullback \
   --testnet
 ```
 

@@ -23,6 +23,8 @@ def create_portfolio_manager(llm, memory):
         bot_state_summary = state.get("bot_state_summary", "")
         regime_summary = state.get("regime_summary", "")
         regime_context = state.get("regime_context", {}) or {}
+        higher_timeframe_summary = state.get("higher_timeframe_summary", "")
+        higher_timeframe_context = state.get("higher_timeframe_context", {}) or {}
         allowed_setup_families = state.get("allowed_setup_families", []) or []
         candidate_summary = state.get("candidate_summary", "")
         candidate_context = state.get("candidate_context", {}) or {}
@@ -79,6 +81,8 @@ Your highest priority is format compliance. You must output the `STRUCTURED_DECI
 - Allowed setup families in this regime: **{', '.join(allowed_setup_families) or 'none'}**
 - Deterministic regime gate: **{regime_summary or 'No regime summary provided.'}**
 - Preferred directional bias from regime gate: **{regime_context.get("preferred_action", "FLAT")}**
+- Higher-timeframe trend filter: **{higher_timeframe_summary or 'No higher-timeframe summary provided.'}**
+- Higher-timeframe preferred direction: **{higher_timeframe_context.get("preferred_action", "FLAT")}**
 - Deterministic candidate gate: **{candidate_summary or 'No candidate summary provided.'}**
 - Current exchange/account state: **{exchange_state_summary or 'No exchange state provided.'}**
 - Current bot state: **{bot_state_summary or 'No bot state provided.'}**
@@ -124,7 +128,7 @@ Rules for the JSON:
 - If the candidate gate says `candidate_setup_present=False`, you must output `action=FLAT` and `position_instruction=NO_ACTION`.
 - If the regime gate says `trade_allowed=True`, only approve the configured `{setup_family}` in the routed direction. For `trend_pullback` that is the regime preferred direction. For `range_fade` that is the deterministic candidate direction from the active range edge. Do not invent alternate setups.
 - If `{setup_family}` is `range_fade`, entries must stay near the active range edge and stops must sit outside the range boundary.
-- If `{setup_family}` is `trend_pullback`, entries must stay inside the pullback zone and should not chase extended price.
+- If `{setup_family}` is `trend_pullback`, entries must stay inside the pullback zone, should not chase extended price, and must align with the higher-timeframe trend filter.
 
 ---
 

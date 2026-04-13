@@ -22,6 +22,7 @@ class BotJournal:
         decision_timestamp: str,
         analysis_timestamp: str,
         regime_snapshot: dict[str, Any] | None,
+        higher_timeframe_snapshot: dict[str, Any] | None,
         candidate_snapshot: dict[str, Any] | None,
         allowed_setup_families: list[str] | None,
         selected_setup_family: str | None,
@@ -53,6 +54,7 @@ class BotJournal:
             outcome,
             outcome_message,
             json.dumps(regime_snapshot or {}),
+            json.dumps(higher_timeframe_snapshot or {}),
             json.dumps(candidate_snapshot or {}),
             json.dumps(raw_action or {}),
             json.dumps(final_action or {}),
@@ -83,6 +85,7 @@ class BotJournal:
                     outcome,
                     outcome_message,
                     regime_snapshot,
+                    higher_timeframe_snapshot,
                     candidate_snapshot,
                     raw_action_payload,
                     final_action_payload,
@@ -92,7 +95,7 @@ class BotJournal:
                     order_intent,
                     order_preview,
                     recorded_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 payload,
             )
@@ -120,6 +123,7 @@ class BotJournal:
                     outcome TEXT NOT NULL,
                     outcome_message TEXT NOT NULL,
                     regime_snapshot TEXT NOT NULL,
+                    higher_timeframe_snapshot TEXT NOT NULL DEFAULT '{}',
                     candidate_snapshot TEXT NOT NULL,
                     raw_action_payload TEXT NOT NULL,
                     final_action_payload TEXT NOT NULL,
@@ -143,5 +147,9 @@ class BotJournal:
             if "selected_setup_family" not in existing_columns:
                 conn.execute(
                     "ALTER TABLE bot_cycle_journal ADD COLUMN selected_setup_family TEXT"
+                )
+            if "higher_timeframe_snapshot" not in existing_columns:
+                conn.execute(
+                    "ALTER TABLE bot_cycle_journal ADD COLUMN higher_timeframe_snapshot TEXT NOT NULL DEFAULT '{}'"
                 )
             conn.commit()

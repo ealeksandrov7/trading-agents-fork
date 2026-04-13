@@ -47,6 +47,30 @@ class RegimeSnapshot:
         )
 
 
+@dataclass
+class HigherTimeframeTrendSnapshot:
+    timeframe: str
+    label: str
+    preferred_action: str
+    current_price: float
+    ema20: float
+    ema50: float
+    ema20_slope_pct: float
+    trend_spread_pct: float
+    reason: str
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    def summary(self) -> str:
+        return (
+            f"HigherTimeframe={self.timeframe} | label={self.label} | preferred_action={self.preferred_action} | "
+            f"price={self.current_price:.2f} | ema20={self.ema20:.2f} | ema50={self.ema50:.2f} | "
+            f"ema20_slope_pct={self.ema20_slope_pct:.4f} | trend_spread_pct={self.trend_spread_pct:.4f} | "
+            f"reason={self.reason}"
+        )
+
+
 def allowed_strategies_for_regime(label: str, config: dict) -> list[str]:
     enabled = set(_enabled_strategy_families(config))
     route_map = _strategy_route_map(config)
@@ -60,6 +84,134 @@ def classify_regime(symbol: str, trade_timestamp: str, config: dict) -> RegimeSn
 
     data = load_ohlcv(symbol, trade_timestamp, timeframe_override=timeframe).copy()
     return classify_regime_from_data(data, config, timeframe=timeframe)
+
+
+def classify_higher_timeframe_trend(
+    symbol: str,
+    trade_timestamp: str,
+    config: dict,
+) -> HigherTimeframeTrendSnapshot:
+    timeframe = str(config.get("bot_higher_timeframe_anchor_timeframe", "4h")).lower()
+    data = load_ohlcv(symbol, trade_timestamp, timeframe_override=timeframe).copy()
+    return classify_higher_timeframe_trend_from_data(data, config, timeframe=timeframe)
+
+
+def classify_higher_timeframe_trend_from_data(
+    data: pd.DataFrame,
+    config: dict,
+    *,
+    timeframe: str = "4h",
+) -> HigherTimeframeTrendSnapshot:
+    timeframe = str(timeframe).lower()
+    if timeframe != "4h":
+        return HigherTimeframeTrendSnapshot(
+            timeframe=timeframe,
+            label="neutral",
+            preferred_action="FLAT",
+            current_price=0.0,
+            ema20=0.0,
+            ema50=0.0,
+            ema20_slope_pct=0.0,
+            trend_spread_pct=0.0,
+            reason=f"Higher-timeframe trend filter currently supports 4h only; got {timeframe}.",
+        )
+    if data.empty or len(data) < 60:
+        return HigherTimeframeTrendSnapshot(
+            timeframe=timeframe,
+            label="neutral",
+            preferred_action="FLAT",
+            current_price=0.0,
+            ema20=0.0,
+            ema50=0.0,
+            ema20_slope_pct=0.0,
+            trend_spread_pct=0.0,
+            reason="Insufficient 4h OHLCV history to classify higher-timeframe trend.",
+        )
+
+    frame = _build_feature_frame(data)
+    latest = frame.iloc[-1]
+    current_price = _safe_float(latest["Close"])
+    ema20 = _safe_float(latest["ema20"])
+    ema50 = _safe_float(latest["ema50"])
+    ema20_slope_pct = (
+        (ema20 - _safe_float(frame.iloc[-7]["ema20"])) / current_price
+        if len(frame) >= 7 and current_price > 0
+        else 0.0
+    )
+    trend_spread_pct = abs(ema20 - ema50) / current_price if current_price > 0 else 0.0
+    trend_spread_min = float(
+        config.get("bot_higher_timeframe_trend_spread_min_pct", config.get("bot_regime_trend_spread_min_pct", 0.003))
+    )
+    trend_slope_min = float(
+        config.get("bot_higher_timeframe_slope_min_pct", config.get("bot_regime_slope_min_pct", 0.0015))
+    )
+
+    if current_price > ema20 > ema50 and trend_spread_pct >= trend_spread_min and ema20_slope_pct >= trend_slope_min:
+        return HigherTimeframeTrendSnapshot(
+            timeframe=timeframe,
+            label="trend_up",
+            preferred_action="LONG",
+            current_price=current_price,
+            ema20=ema20,
+            ema50=ema50,
+            ema20_slope_pct=ema20_slope_pct,
+            trend_spread_pct=trend_spread_pct,
+            reason="4h uptrend confirmed by EMA stack, spread, and positive EMA slope.",
+        )
+    if current_price < ema20 < ema50 and trend_spread_pct >= trend_spread_min and ema20_slope_pct <= -trend_slope_min:
+        return HigherTimeframeTrendSnapshot(
+            timeframe=timeframe,
+            label="trend_down",
+            preferred_action="SHORT",
+            current_price=current_price,
+            ema20=ema20,
+            ema50=ema50,
+            ema20_slope_pct=ema20_slope_pct,
+            trend_spread_pct=trend_spread_pct,
+            reason="4h downtrend confirmed by EMA stack, spread, and negative EMA slope.",
+        )
+    return HigherTimeframeTrendSnapshot(
+        timeframe=timeframe,
+        label="neutral",
+        preferred_action="FLAT",
+        current_price=current_price,
+        ema20=ema20,
+        ema50=ema50,
+        ema20_slope_pct=ema20_slope_pct,
+        trend_spread_pct=trend_spread_pct,
+        reason="4h structure is neutral or transitional; no higher-timeframe trend bias.",
+    )
+
+
+def apply_higher_timeframe_filter(
+    regime: RegimeSnapshot,
+    higher_timeframe: HigherTimeframeTrendSnapshot,
+    config: dict,
+) -> RegimeSnapshot:
+    if not bool(config.get("bot_higher_timeframe_filter_enabled", True)):
+        return regime
+    if regime.setup_family != "trend_pullback":
+        return regime
+    if regime.label not in {"trend_up", "trend_down"}:
+        return regime
+    aligned = (
+        (regime.preferred_action == "LONG" and higher_timeframe.label == "trend_up")
+        or (regime.preferred_action == "SHORT" and higher_timeframe.label == "trend_down")
+    )
+    if aligned:
+        return regime
+    return RegimeSnapshot(
+        **{
+            **regime.to_dict(),
+            "trade_allowed": False,
+            "setup_family": "",
+            "allowed_setup_families": [],
+            "reason": (
+                f"{regime.reason} Blocked by higher timeframe filter: "
+                f"1h {regime.label} requires aligned 4h bias, but got {higher_timeframe.label}."
+            ),
+        }
+    )
 
 
 def classify_regime_from_data(

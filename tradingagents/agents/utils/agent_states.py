@@ -56,6 +56,8 @@ class AgentState(MessagesState):
     bot_state_summary: Annotated[str, "Concise autonomous bot state summary"]
     regime_summary: Annotated[str, "Deterministic regime-classifier summary for the active bar"]
     regime_context: Annotated[dict, "Structured regime payload for the active bar"]
+    higher_timeframe_summary: Annotated[str, "Deterministic higher-timeframe trend summary for the active bar"]
+    higher_timeframe_context: Annotated[dict, "Structured higher-timeframe trend payload for the active bar"]
     allowed_setup_families: Annotated[list[str], "Strategies allowed by the deterministic regime router"]
     candidate_summary: Annotated[str, "Deterministic setup-candidate summary for the active bar"]
     candidate_context: Annotated[dict, "Structured setup-candidate payload for the active bar"]

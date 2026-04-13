@@ -63,6 +63,7 @@ class BotState(BaseModel):
     kill_switch_enabled: bool = False
     consecutive_failures: int = 0
     regime_snapshot: Optional[dict] = None
+    higher_timeframe_snapshot: Optional[dict] = None
     candidate_snapshot: Optional[dict] = None
     last_decision_diagnostics: Optional[dict] = None
 

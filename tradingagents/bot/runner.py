@@ -30,10 +30,14 @@ from .models import BotActionPlan, BotConfig, BotState
 from .candidate import CandidateSnapshot, detect_candidate
 from .journal import BotJournal
 from .regime import (
+    HigherTimeframeTrendSnapshot,
     RegimeSnapshot,
     allowed_strategies_for_regime,
+    apply_higher_timeframe_filter,
     classify_regime,
     classify_regime_from_data,
+    classify_higher_timeframe_trend,
+    classify_higher_timeframe_trend_from_data,
 )
 from .replay import evaluate_replay_observation, summarize_replay
 from .state import BotStateStore
@@ -121,6 +125,7 @@ class BotRunner:
         diagnostics = analysis["diagnostics"]
         analysis_timestamp = datetime.now(timezone.utc).isoformat()
         state.regime_snapshot = diagnostics["regime"]
+        state.higher_timeframe_snapshot = diagnostics["higher_timeframe"]
         state.candidate_snapshot = diagnostics["candidate"]
         state.last_decision_diagnostics = diagnostics
         events = self.store.append_event(
@@ -129,6 +134,13 @@ class BotRunner:
             event_type="regime",
             message=diagnostics["regime"]["reason"],
             payload=diagnostics["regime"],
+        )
+        events = self.store.append_event(
+            state,
+            events,
+            event_type="higher_timeframe",
+            message=diagnostics["higher_timeframe"]["reason"],
+            payload=diagnostics["higher_timeframe"],
         )
         events = self.store.append_event(
             state,
@@ -488,6 +500,9 @@ class BotRunner:
         regime_snapshot = state.regime_snapshot or {}
         init_state["regime_summary"] = regime_snapshot.get("summary", "")
         init_state["regime_context"] = regime_snapshot
+        higher_timeframe_snapshot = state.higher_timeframe_snapshot or {}
+        init_state["higher_timeframe_summary"] = higher_timeframe_snapshot.get("summary", "")
+        init_state["higher_timeframe_context"] = higher_timeframe_snapshot
         candidate_snapshot = state.candidate_snapshot or {}
         init_state["candidate_summary"] = candidate_snapshot.get("summary", "")
         init_state["candidate_context"] = candidate_snapshot
@@ -510,6 +525,7 @@ class BotRunner:
     ) -> dict[str, Any]:
         if replay_bars is None:
             regime = self._classify_regime(state.symbol, decision_timestamp)
+            higher_timeframe = self._classify_higher_timeframe_trend(state.symbol, decision_timestamp)
         else:
             try:
                 regime = self._classify_regime(
@@ -519,7 +535,10 @@ class BotRunner:
                 )
             except TypeError:
                 regime = self._classify_regime(state.symbol, decision_timestamp)
+            higher_timeframe = self._higher_timeframe_with_fallback(state.symbol, decision_timestamp, replay_bars)
+        regime = apply_higher_timeframe_filter(regime, higher_timeframe, self.config)
         state.regime_snapshot = {**regime.to_dict(), "summary": regime.summary()}
+        state.higher_timeframe_snapshot = {**higher_timeframe.to_dict(), "summary": higher_timeframe.summary()}
         selected_strategy = strategy_family or self._select_strategy_for_regime(regime)
         candidate = self._candidate_with_fallback(
             state.symbol,
@@ -532,6 +551,10 @@ class BotRunner:
         self._emit(
             f"[bot] regime {regime.label} | allowed={regime.trade_allowed} | "
             f"preferred={regime.preferred_action} | strategies={','.join(regime.allowed_setup_families) or 'none'}"
+        )
+        self._emit(
+            f"[bot] higher timeframe {higher_timeframe.timeframe} | label={higher_timeframe.label} | "
+            f"preferred={higher_timeframe.preferred_action}"
         )
         self._emit(
             f"[bot] candidate present={candidate.candidate_setup_present} | strategy={candidate.setup_family} | direction={candidate.direction}"
@@ -553,6 +576,7 @@ class BotRunner:
                 "action": raw_action,
                 "diagnostics": {
                     "regime": state.regime_snapshot,
+                    "higher_timeframe": state.higher_timeframe_snapshot,
                     "candidate": state.candidate_snapshot,
                     "raw_action": raw_action,
                     "quality_filter_reasons": [],
@@ -568,6 +592,7 @@ class BotRunner:
         )
         diagnostics = {
             "regime": state.regime_snapshot,
+            "higher_timeframe": state.higher_timeframe_snapshot,
             "candidate": state.candidate_snapshot,
             "raw_action": raw_action,
             "quality_filter_reasons": quality_filter_reasons,
@@ -668,6 +693,52 @@ class BotRunner:
                 pullback_zone_high=None,
                 reason=f"Regime classification failed: {exc}",
             )
+
+    def _classify_higher_timeframe_trend(
+        self,
+        symbol: str,
+        decision_timestamp: str,
+        *,
+        replay_bars: Optional[pd.DataFrame] = None,
+    ) -> HigherTimeframeTrendSnapshot:
+        try:
+            if replay_bars is not None:
+                anchor = str(self.config.get("bot_higher_timeframe_anchor_timeframe", "4h")).lower()
+                resampled = self._resample_bars_to_timeframe(replay_bars, anchor)
+                cutoff = pd.to_datetime(decision_timestamp, utc=True, errors="coerce")
+                resampled = resampled[resampled["Date"] <= cutoff]
+                return classify_higher_timeframe_trend_from_data(resampled, self.config, timeframe=anchor)
+            vendor_symbol = self.bot_config.symbol
+            return classify_higher_timeframe_trend(vendor_symbol, decision_timestamp, self.config)
+        except Exception as exc:
+            return HigherTimeframeTrendSnapshot(
+                timeframe=str(self.config.get("bot_higher_timeframe_anchor_timeframe", "4h")),
+                label="neutral",
+                preferred_action="FLAT",
+                current_price=0.0,
+                ema20=0.0,
+                ema50=0.0,
+                ema20_slope_pct=0.0,
+                trend_spread_pct=0.0,
+                reason=f"Higher-timeframe trend classification failed: {exc}",
+            )
+
+    def _higher_timeframe_with_fallback(
+        self,
+        symbol: str,
+        decision_timestamp: str,
+        replay_bars: pd.DataFrame,
+    ) -> HigherTimeframeTrendSnapshot:
+        try:
+            return self._classify_higher_timeframe_trend(symbol, decision_timestamp, replay_bars=replay_bars)
+        except TypeError:
+            anchor = str(self.config.get("bot_higher_timeframe_anchor_timeframe", "4h")).lower()
+            if anchor == "4h":
+                resampled = self._resample_bars_to_timeframe(replay_bars, anchor)
+                cutoff = pd.to_datetime(decision_timestamp, utc=True, errors="coerce")
+                resampled = resampled[resampled["Date"] <= cutoff]
+                return classify_higher_timeframe_trend_from_data(resampled, self.config, timeframe=anchor)
+            return self._classify_higher_timeframe_trend(symbol, decision_timestamp)
 
     def _detect_candidate(
         self,
@@ -920,6 +991,7 @@ class BotRunner:
             f"Active order id: {state.active_order_id or 'none'} | "
             f"Position: {state.current_position or 'none'} | "
             f"Regime: {(state.regime_snapshot or {}).get('label', 'unknown')} | "
+            f"Higher timeframe: {(state.higher_timeframe_snapshot or {}).get('label', 'unknown')} | "
             f"Failures: {state.consecutive_failures}"
         )
 
@@ -1013,6 +1085,8 @@ class BotRunner:
             snapshot = self._historical_snapshot_for_timestamp(bars, ts)
             if replay_mode == "regime-only":
                 regime = self._replay_regime(state.symbol, ts.strftime("%Y-%m-%d %H:%M"), bars)
+                higher_timeframe = self._higher_timeframe_with_fallback(state.symbol, ts.strftime("%Y-%m-%d %H:%M"), bars)
+                regime = apply_higher_timeframe_filter(regime, higher_timeframe, self.config)
                 observations.append(
                     self._build_replay_observation(
                         bars,
@@ -1020,6 +1094,7 @@ class BotRunner:
                         ts,
                         replay_mode,
                         regime,
+                        higher_timeframe,
                         CandidateSnapshot(
                             candidate_setup_present=False,
                             setup_family="",
@@ -1047,6 +1122,8 @@ class BotRunner:
                 continue
             elif replay_mode in {"candidate-only", "deterministic-only"}:
                 regime = self._replay_regime(state.symbol, ts.strftime("%Y-%m-%d %H:%M"), bars)
+                higher_timeframe = self._higher_timeframe_with_fallback(state.symbol, ts.strftime("%Y-%m-%d %H:%M"), bars)
+                regime = apply_higher_timeframe_filter(regime, higher_timeframe, self.config)
                 strategies = [
                     strategy
                     for strategy in (regime.allowed_setup_families or [])
@@ -1060,6 +1137,7 @@ class BotRunner:
                             ts,
                             replay_mode,
                             regime,
+                            higher_timeframe,
                             CandidateSnapshot(
                                 candidate_setup_present=False,
                                 setup_family="",
@@ -1133,6 +1211,7 @@ class BotRunner:
                             ts,
                             replay_mode,
                             regime,
+                            higher_timeframe,
                             candidate,
                             action,
                             quality_filter_reasons=[],
@@ -1145,6 +1224,8 @@ class BotRunner:
                 continue
             else:
                 regime = self._replay_regime(state.symbol, ts.strftime("%Y-%m-%d %H:%M"), bars)
+                higher_timeframe = self._higher_timeframe_with_fallback(state.symbol, ts.strftime("%Y-%m-%d %H:%M"), bars)
+                regime = apply_higher_timeframe_filter(regime, higher_timeframe, self.config)
                 strategy = self._select_strategy_for_regime(regime)
                 if strategy_filter is not None and strategy != strategy_filter:
                     observations.append(
@@ -1154,6 +1235,7 @@ class BotRunner:
                             ts,
                             replay_mode,
                             regime,
+                            higher_timeframe,
                             CandidateSnapshot(
                                 candidate_setup_present=False,
                                 setup_family=strategy or "",
@@ -1193,6 +1275,7 @@ class BotRunner:
                         ts,
                         replay_mode,
                         RegimeSnapshot(**{k: v for k, v in analysis["diagnostics"]["regime"].items() if k != "summary"}),
+                        HigherTimeframeTrendSnapshot(**{k: v for k, v in analysis["diagnostics"]["higher_timeframe"].items() if k != "summary"}),
                         CandidateSnapshot(**{k: v for k, v in analysis["diagnostics"]["candidate"].items() if k != "summary"}),
                         analysis["action"],
                         quality_filter_reasons=analysis["diagnostics"]["quality_filter_reasons"],
@@ -1237,6 +1320,24 @@ class BotRunner:
                 timeframe=timeframe,
             )
         return load_ohlcv(symbol, end_timestamp, timeframe_override=timeframe)
+
+    def _resample_bars_to_timeframe(self, bars: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+        frame = bars.sort_values("Date").copy()
+        frame["Date"] = pd.to_datetime(frame["Date"], utc=True, errors="coerce")
+        frame = frame.dropna(subset=["Date"]).set_index("Date")
+        if timeframe != "4h":
+            raise ValueError(f"Unsupported replay resample timeframe: {timeframe}")
+        resampled = frame.resample("4h", label="right", closed="right").agg(
+            {
+                "Open": "first",
+                "High": "max",
+                "Low": "min",
+                "Close": "last",
+                "Volume": "sum",
+            }
+        )
+        resampled = resampled.dropna(subset=["Open", "High", "Low", "Close"]).reset_index()
+        return resampled
 
     def _replay_analysis_timestamps(
         self,
@@ -1359,23 +1460,25 @@ class BotRunner:
         stop_loss: float,
         side: str,
     ) -> tuple[dict[str, Any], bool, str]:
-        risk = entry_mid - stop_loss if side == TradeAction.LONG.value else stop_loss - entry_mid
+        entry_price = self._trend_pullback_entry_price(candidate, side, entry_mid)
+        risk = entry_price - stop_loss if side == TradeAction.LONG.value else stop_loss - entry_price
         if risk <= 0:
             reason = "Trend pullback deterministic risk is non-positive."
             return self._build_replay_flat_action(symbol, timestamp, reason), False, reason
         r_multiple = float(self.config.get("bot_deterministic_trend_pullback_target_r_multiple", 2.0))
-        take_profit = entry_mid + risk * r_multiple if side == TradeAction.LONG.value else entry_mid - risk * r_multiple
+        take_profit = entry_price + risk * r_multiple if side == TradeAction.LONG.value else entry_price - risk * r_multiple
         expiry = int(self.config.get("bot_deterministic_trend_pullback_expiry_bars", 5))
+        entry_style = str(self.config.get("bot_deterministic_trend_pullback_entry_style", "midpoint")).lower()
         action = {
             "symbol": symbol,
             "timestamp": timestamp,
             "action": side,
-            "entry_mode": "LIMIT_ZONE",
-            "entry_price": None,
+            "entry_mode": "LIMIT",
+            "entry_price": entry_price,
             "entry_zone_low": candidate.entry_zone_low,
             "entry_zone_high": candidate.entry_zone_high,
             "confidence": 0.55,
-            "thesis_summary": "Deterministic trend_pullback replay action from candidate baseline rules.",
+            "thesis_summary": f"Deterministic trend_pullback replay action using {entry_style} entry style.",
             "time_horizon": self.bot_config.timeframe,
             "stop_loss": stop_loss,
             "take_profit": take_profit,
@@ -1385,6 +1488,23 @@ class BotRunner:
             "position_instruction": "OPEN",
         }
         return action, True, "Deterministic trend_pullback action built successfully."
+
+    def _trend_pullback_entry_price(
+        self,
+        candidate: CandidateSnapshot,
+        side: str,
+        midpoint: float,
+    ) -> float:
+        if candidate.entry_zone_low is None or candidate.entry_zone_high is None:
+            return midpoint
+        zone_low = float(candidate.entry_zone_low)
+        zone_high = float(candidate.entry_zone_high)
+        style = str(self.config.get("bot_deterministic_trend_pullback_entry_style", "midpoint")).lower()
+        if style == "near_price":
+            return zone_high if side == TradeAction.LONG.value else zone_low
+        if style == "deep_pullback":
+            return zone_low if side == TradeAction.LONG.value else zone_high
+        return midpoint
 
     def _build_range_fade_deterministic_action(
         self,
@@ -1449,6 +1569,7 @@ class BotRunner:
         timestamp: pd.Timestamp,
         replay_mode: str,
         regime: RegimeSnapshot,
+        higher_timeframe: HigherTimeframeTrendSnapshot,
         candidate: CandidateSnapshot,
         action: dict[str, Any],
         *,
@@ -1468,6 +1589,8 @@ class BotRunner:
             "regime_label": regime.label,
             "regime_trade_allowed": regime.trade_allowed,
             "regime_reason": regime.reason,
+            "higher_timeframe_label": higher_timeframe.label,
+            "higher_timeframe_reason": higher_timeframe.reason,
             "candidate_setup_present": candidate.candidate_setup_present,
             "candidate_reason": candidate.reason,
             "quality_filter_reasons": quality_filter_reasons,
@@ -1619,6 +1742,7 @@ class BotRunner:
             decision_timestamp=decision_timestamp,
             analysis_timestamp=analysis_timestamp,
             regime_snapshot=diagnostics.get("regime"),
+            higher_timeframe_snapshot=diagnostics.get("higher_timeframe"),
             candidate_snapshot=diagnostics.get("candidate"),
             allowed_setup_families=(diagnostics.get("regime") or {}).get("allowed_setup_families", []),
             selected_setup_family=(diagnostics.get("candidate") or {}).get("setup_family"),
