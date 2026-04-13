@@ -1486,10 +1486,14 @@ def main():
 def bot(
     symbol: str = typer.Option("BTC-USD", "--symbol", help="Instrument to trade."),
     timeframe: str = typer.Option("1h", "--timeframe", help="Decision timeframe."),
+    decision_mode: str = typer.Option("llm", "--decision-mode", help="Decision path: llm or deterministic."),
     analysis_interval_minutes: int = typer.Option(240, "--analysis-interval-minutes", help="How often to rerun the full analysis graph."),
     once: bool = typer.Option(False, "--once", help="Run exactly one bot cycle and exit."),
     testnet: bool = typer.Option(True, "--testnet/--mainnet", help="Use Hyperliquid testnet."),
 ):
+    selected_decision_mode = decision_mode.strip().lower()
+    if selected_decision_mode not in {"llm", "deterministic"}:
+        raise typer.BadParameter("decision_mode must be one of: llm, deterministic")
     config = DEFAULT_CONFIG.copy()
     config["analysis_timeframe"] = timeframe
     config["decision_timeframe"] = timeframe
@@ -1500,6 +1504,7 @@ def bot(
         bot_config=BotConfig(
             symbol=symbol,
             timeframe=timeframe,
+            decision_mode=selected_decision_mode,
             testnet=testnet,
             once=once,
             analysis_interval_minutes=config["bot_analysis_interval_minutes"],

@@ -515,6 +515,45 @@ class BotRunner:
         final_state = graph.graph.invoke(init_state, config=graph_args["config"])
         return final_state
 
+    def _decision_mode(self) -> str:
+        mode = str(getattr(self.bot_config, "decision_mode", "llm") or "llm").strip().lower()
+        return mode if mode in {"llm", "deterministic"} else "llm"
+
+    def _build_deterministic_live_decision(
+        self,
+        state: BotState,
+        decision_timestamp: str,
+        candidate: CandidateSnapshot,
+    ) -> dict[str, Any]:
+        action, generated, reason = self._build_deterministic_replay_action(
+            state.symbol,
+            decision_timestamp,
+            candidate,
+        )
+        if not generated:
+            return {
+                "messages": [],
+                "market_report": f"Deterministic decision path rejected candidate. {reason}",
+                "final_trade_decision": (
+                    "STRUCTURED_DECISION\n```json\n"
+                    f"{json.dumps(action, indent=2)}\n```\n"
+                    f"EXECUTIVE_SUMMARY\nStand aside. {reason}"
+                ),
+                "final_trade_action": action,
+                "final_trade_action_error": "",
+            }
+        return {
+            "messages": [],
+            "market_report": f"Deterministic decision path approved {candidate.setup_family}. {reason}",
+            "final_trade_decision": (
+                "STRUCTURED_DECISION\n```json\n"
+                f"{json.dumps(action, indent=2)}\n```\n"
+                f"EXECUTIVE_SUMMARY\nExecute deterministic {candidate.setup_family} action."
+            ),
+            "final_trade_action": action,
+            "final_trade_action_error": "",
+        }
+
     def _analyze_decision(
         self,
         state: BotState,
@@ -559,11 +598,15 @@ class BotRunner:
         self._emit(
             f"[bot] candidate present={candidate.candidate_setup_present} | strategy={candidate.setup_family} | direction={candidate.direction}"
         )
+        decision_mode = self._decision_mode()
+        self._emit(f"[bot] decision mode={decision_mode}")
 
         if not regime.trade_allowed:
             final_state = self._build_blocked_regime_decision(state, decision_timestamp, regime)
         elif not candidate.candidate_setup_present:
             final_state = self._build_blocked_candidate_decision(state, decision_timestamp, regime, candidate)
+        elif decision_mode == "deterministic":
+            final_state = self._build_deterministic_live_decision(state, decision_timestamp, candidate)
         else:
             final_state = self._run_decision(state, snapshot, decision_timestamp)
 
@@ -578,6 +621,7 @@ class BotRunner:
                     "regime": state.regime_snapshot,
                     "higher_timeframe": state.higher_timeframe_snapshot,
                     "candidate": state.candidate_snapshot,
+                    "decision_mode": decision_mode,
                     "raw_action": raw_action,
                     "quality_filter_reasons": [],
                     "final_action": raw_action,
@@ -594,6 +638,7 @@ class BotRunner:
             "regime": state.regime_snapshot,
             "higher_timeframe": state.higher_timeframe_snapshot,
             "candidate": state.candidate_snapshot,
+            "decision_mode": decision_mode,
             "raw_action": raw_action,
             "quality_filter_reasons": quality_filter_reasons,
             "final_action": normalized_action,
@@ -759,9 +804,10 @@ class BotRunner:
                 frame = load_ohlcv(self.bot_config.symbol, decision_timestamp, timeframe_override=self.bot_config.timeframe)
             return detect_candidate(frame, regime, self.config, setup_family=setup_family)
         except Exception as exc:
+            fallback_setup_family = str(setup_family or regime.setup_family or "").strip()
             return CandidateSnapshot(
                 candidate_setup_present=False,
-                setup_family=str(setup_family or regime.setup_family or self.config.get("bot_strategy_setup_family", "trend_pullback")),
+                setup_family=fallback_setup_family,
                 direction=regime.preferred_action,
                 entry_zone_low=regime.pullback_zone_low,
                 entry_zone_high=regime.pullback_zone_high,
@@ -1742,7 +1788,7 @@ class BotRunner:
         order_preview: Optional[dict[str, Any]] = None,
     ) -> None:
         self.journal.insert_cycle(
-            mode="live",
+            mode=f"live:{self._decision_mode()}",
             symbol=state.symbol,
             timeframe=state.timeframe,
             decision_timestamp=decision_timestamp,

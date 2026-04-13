@@ -11,6 +11,7 @@ from tradingagents.execution import ExchangeStateSnapshot, OrderIntent, Position
 class BotConfig(BaseModel):
     symbol: str = "BTC-USD"
     timeframe: str = "1h"
+    decision_mode: Literal["llm", "deterministic"] = "llm"
     analysis_interval_minutes: int = 240
     reconcile_interval_seconds: int = 60
     setup_expiry_bars_default: int = 3
