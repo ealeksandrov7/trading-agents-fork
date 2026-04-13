@@ -118,6 +118,7 @@ def build_backtesting_frame_from_bars(
     signal_frame["deterministic_action_generated"] = False
     signal_frame["signal"] = 0
     signal_frame["entry_price"] = pd.NA
+    signal_frame["entry_mode"] = "LIMIT"
     signal_frame["entry_zone_low"] = pd.NA
     signal_frame["entry_zone_high"] = pd.NA
     signal_frame["stop_loss"] = pd.NA
@@ -138,6 +139,7 @@ def build_backtesting_frame_from_bars(
         "higher_timeframe_filter_enabled": bool(
             merged_config.get("bot_higher_timeframe_filter_enabled", True) and strategy == "trend_pullback"
         ),
+        "price_scale": 1.0,
     }
 
     for ts in timestamps:
@@ -191,11 +193,17 @@ def build_backtesting_frame_from_bars(
         summary["deterministic_actions"] += 1
         signal_frame.at[timestamp, "signal"] = 1 if action["action"] == "LONG" else -1
         signal_frame.at[timestamp, "entry_price"] = entry_mid
+        signal_frame.at[timestamp, "entry_mode"] = str(action.get("entry_mode") or "LIMIT").upper()
         signal_frame.at[timestamp, "entry_zone_low"] = action.get("entry_zone_low")
         signal_frame.at[timestamp, "entry_zone_high"] = action.get("entry_zone_high")
         signal_frame.at[timestamp, "stop_loss"] = action.get("stop_loss")
         signal_frame.at[timestamp, "take_profit"] = action.get("take_profit")
         signal_frame.at[timestamp, "expiry_bars"] = action.get("setup_expiry_bars")
+
+    scale = _derive_price_scale(signal_frame)
+    if scale != 1.0:
+        signal_frame = _scale_backtest_frame(signal_frame, scale)
+        summary["price_scale"] = scale
 
     return PreparedBacktest(frame=signal_frame, summary=summary)
 
@@ -429,15 +437,11 @@ def _normalize_bars_for_backtest(bars: pd.DataFrame) -> pd.DataFrame:
 def _import_backtesting_classes():
     try:
         from backtesting import Backtest, Strategy
-        try:
-            from backtesting.lib import FractionalBacktest
-        except ImportError:
-            FractionalBacktest = Backtest
     except ImportError as exc:
         raise BacktestingUnavailableError(
             "backtesting.py is not installed. Install the optional 'backtesting' package to use this research harness."
         ) from exc
-    return FractionalBacktest, Strategy
+    return Backtest, Strategy
 
 
 def _make_precomputed_strategy_class(strategy_base, strategy_name: str):
@@ -472,19 +476,38 @@ def _make_precomputed_strategy_class(strategy_base, strategy_name: str):
 
             direction = int(self.data.signal[-1])
             entry_price = self.data.entry_price[-1]
+            entry_mode = str(self.data.entry_mode[-1]).upper()
             stop_loss = self.data.stop_loss[-1]
             take_profit = self.data.take_profit[-1]
             expiry_bars = self.data.expiry_bars[-1]
-            if direction == 0 or pd.isna(entry_price) or pd.isna(stop_loss) or pd.isna(take_profit):
+            if direction == 0 or pd.isna(stop_loss) or pd.isna(take_profit):
                 return
 
             kwargs = {
                 "size": self.order_fraction,
-                "limit": float(entry_price),
                 "sl": float(stop_loss),
                 "tp": float(take_profit),
                 "tag": str(self.data.reason[-1]),
             }
+            if direction > 0 and not float(stop_loss) < float(take_profit):
+                return
+            if direction < 0 and not float(take_profit) < float(stop_loss):
+                return
+            if entry_mode != "MARKET":
+                if pd.isna(entry_price):
+                    return
+                limit_price = float(entry_price)
+                if direction > 0 and not (float(stop_loss) < limit_price < float(take_profit)):
+                    return
+                if direction < 0 and not (float(take_profit) < limit_price < float(stop_loss)):
+                    return
+                kwargs["limit"] = limit_price
+            else:
+                market_price = float(self.data.Close[-1])
+                if direction > 0 and not (float(stop_loss) < market_price < float(take_profit)):
+                    return
+                if direction < 0 and not (float(take_profit) < market_price < float(stop_loss)):
+                    return
             order = self.buy(**kwargs) if direction > 0 else self.sell(**kwargs)
             self._pending_order = order
             expiry = int(expiry_bars) if not pd.isna(expiry_bars) else 0
@@ -508,7 +531,7 @@ def _normalize_parameter_grid(strategy_name: str, parameter_grid: Optional[dict[
         "trend_pullback": {
             "target_r": [1.0, 1.5, 2.0],
             "expiry_bars": [3, 5, 7, 9],
-            "entry_style": ["midpoint", "near_price", "deep_pullback"],
+            "entry_style": ["midpoint", "near_price", "deep_pullback", "market_confirmed"],
         },
         "range_fade": {
             "target_mode": ["reference", "fixed_r"],
@@ -606,6 +629,31 @@ def _serialize_frame(frame: pd.DataFrame) -> list[dict[str, Any]]:
         if pd.api.types.is_datetime64_any_dtype(safe[column]):
             safe[column] = safe[column].astype(str)
     return safe.to_dict(orient="records")
+
+
+def _derive_price_scale(frame: pd.DataFrame) -> float:
+    max_close = pd.to_numeric(frame["Close"], errors="coerce").max()
+    if pd.isna(max_close) or max_close <= 10_000:
+        return 1.0
+    return min(1.0, 1_000.0 / float(max_close))
+
+
+def _scale_backtest_frame(frame: pd.DataFrame, scale: float) -> pd.DataFrame:
+    scaled = frame.copy()
+    for column in [
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "entry_price",
+        "entry_zone_low",
+        "entry_zone_high",
+        "stop_loss",
+        "take_profit",
+    ]:
+        if column in scaled.columns:
+            scaled[column] = pd.to_numeric(scaled[column], errors="coerce") * scale
+    return scaled
 
 
 def _entry_midpoint(action: dict[str, Any]) -> Optional[float]:

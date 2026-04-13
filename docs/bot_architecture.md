@@ -102,9 +102,16 @@ Current supported candidate detectors:
   - regime must already route to trend continuation
   - higher-timeframe trend must align with the `1h` direction
   - recent bars must retrace into the allowed pullback zone
-  - reclaim/continuation confirmation must exist
+  - candidate evaluation is staged and scored rather than purely all-or-nothing
+  - current stage diagnostics are:
+    - `trend_context_pass`
+    - `pullback_touch_pass`
+    - `reclaim_pass`
+    - `extension_pass`
+    - `rr_pass`
+  - reclaim quality is tiered as `weak`, `medium`, or `strong`
   - an invalidation level must be derivable
-  - estimated reward-to-risk must exceed configured minimum
+  - reward-to-risk contributes to the score but is no longer the only hard candidate gate
 - `range_fade`
   - regime must already route to range mean reversion
   - recent structure must remain inside a bounded range
@@ -113,6 +120,13 @@ Current supported candidate detectors:
   - stop and target must fit a favorable reward-to-risk profile
 
 If `candidate_setup_present=False`, the graph is skipped entirely.
+
+Current practical interpretation of the `trend_pullback` candidate:
+
+- the candidate layer is intentionally broader for research than the earlier textbook-only version
+- weak reclaim bars are still rejected
+- medium and strong reclaim bars can pass if the overall score clears the threshold
+- this is meant to preserve more valid samples for replay and backtesting without opening the floodgates completely
 
 ## LLM Graph Role
 
@@ -326,9 +340,15 @@ The deterministic replay baseline is intentionally simple. It is meant to benchm
 
 Current defaults:
 
-- `bot_deterministic_trend_pullback_target_r_multiple = 2.0`
-- `bot_deterministic_trend_pullback_expiry_bars = 5`
-- `bot_deterministic_trend_pullback_entry_style = "midpoint"`
+- `bot_deterministic_trend_pullback_target_r_multiple = 1.5`
+- `bot_deterministic_trend_pullback_expiry_bars = 3`
+- `bot_deterministic_trend_pullback_entry_style = "market_confirmed"`
+
+Current practical interpretation:
+
+- the deterministic baseline now waits for a higher-quality reclaim bar
+- then it enters on confirmation rather than automatically resting a deeper limit back into the zone
+- this change was made because the earlier midpoint/zone re-entry baseline backtested poorly on the March-April 2026 Hyperliquid sample
 
 ### range_fade deterministic spec
 
@@ -438,6 +458,11 @@ Key bot-specific defaults:
 - `bot_journal_path = "./results/bot_journal.sqlite"`
 - regime thresholds for spread/slope/volatility
 - `bot_pullback_atr_tolerance`
+- `bot_trend_pullback_touch_lookback_bars`
+- `bot_trend_pullback_max_extension_atr`
+- `bot_trend_pullback_reclaim_close_location_min`
+- `bot_trend_pullback_rr_research_floor`
+- `bot_trend_pullback_candidate_score_min`
 - range-fade thresholds for edge proximity, width sanity, stop buffer, and target buffer
 - deterministic replay target/expiry settings per strategy
 - per-timeframe max entry distance

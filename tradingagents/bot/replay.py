@@ -87,6 +87,8 @@ def summarize_replay(observations: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "top_deterministic_reasons_by_strategy": {},
         "top_quality_filter_reasons_by_strategy": {},
         "regime_behavior": {},
+        "candidate_stage_pass_by_strategy": {},
+        "candidate_score_buckets_by_strategy": {},
     }
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     by_strategy: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -138,6 +140,8 @@ def summarize_replay(observations: Iterable[dict[str, Any]]) -> dict[str, Any]:
         }
         skipped = [item for item in items if not item.get("executed")]
         summary["top_candidate_reasons_by_strategy"][strategy] = _top_reasons(skipped, "candidate_reason")
+        summary["candidate_stage_pass_by_strategy"][strategy] = _stage_pass_counts(items)
+        summary["candidate_score_buckets_by_strategy"][strategy] = _score_buckets(items)
         summary["top_deterministic_reasons_by_strategy"][strategy] = _top_reasons(
             [
                 item
@@ -244,6 +248,33 @@ def _average_metric(items: list[dict[str, Any]], key: str) -> Optional[float]:
     if not values:
         return None
     return sum(values) / len(values)
+
+
+def _stage_pass_counts(items: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = defaultdict(int)
+    for item in items:
+        for key, value in (item.get("candidate_stage_flags") or {}).items():
+            if value:
+                counts[str(key)] += 1
+    return dict(counts)
+
+
+def _score_buckets(items: list[dict[str, Any]]) -> dict[str, int]:
+    buckets = {"lt2.0": 0, "2.0-2.5": 0, "2.5-3.0": 0, "ge3.0": 0}
+    for item in items:
+        score = item.get("candidate_score")
+        if score is None:
+            continue
+        score = float(score)
+        if score < 2.0:
+            buckets["lt2.0"] += 1
+        elif score < 2.5:
+            buckets["2.0-2.5"] += 1
+        elif score < 3.0:
+            buckets["2.5-3.0"] += 1
+        else:
+            buckets["ge3.0"] += 1
+    return buckets
 
 
 def _forward_close_return(frame: pd.DataFrame, current_idx: int, horizon: int) -> Optional[float]:

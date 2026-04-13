@@ -1461,6 +1461,7 @@ class BotRunner:
         side: str,
     ) -> tuple[dict[str, Any], bool, str]:
         entry_price = self._trend_pullback_entry_price(candidate, side, entry_mid)
+        entry_style = str(self.config.get("bot_deterministic_trend_pullback_entry_style", "midpoint")).lower()
         risk = entry_price - stop_loss if side == TradeAction.LONG.value else stop_loss - entry_price
         if risk <= 0:
             reason = "Trend pullback deterministic risk is non-positive."
@@ -1468,13 +1469,12 @@ class BotRunner:
         r_multiple = float(self.config.get("bot_deterministic_trend_pullback_target_r_multiple", 2.0))
         take_profit = entry_price + risk * r_multiple if side == TradeAction.LONG.value else entry_price - risk * r_multiple
         expiry = int(self.config.get("bot_deterministic_trend_pullback_expiry_bars", 5))
-        entry_style = str(self.config.get("bot_deterministic_trend_pullback_entry_style", "midpoint")).lower()
         action = {
             "symbol": symbol,
             "timestamp": timestamp,
             "action": side,
-            "entry_mode": "LIMIT",
-            "entry_price": entry_price,
+            "entry_mode": "MARKET" if entry_style == "market_confirmed" else "LIMIT",
+            "entry_price": None if entry_style == "market_confirmed" else entry_price,
             "entry_zone_low": candidate.entry_zone_low,
             "entry_zone_high": candidate.entry_zone_high,
             "confidence": 0.55,
@@ -1500,6 +1500,8 @@ class BotRunner:
         zone_low = float(candidate.entry_zone_low)
         zone_high = float(candidate.entry_zone_high)
         style = str(self.config.get("bot_deterministic_trend_pullback_entry_style", "midpoint")).lower()
+        if style == "market_confirmed":
+            return midpoint
         if style == "near_price":
             return zone_high if side == TradeAction.LONG.value else zone_low
         if style == "deep_pullback":
@@ -1593,6 +1595,10 @@ class BotRunner:
             "higher_timeframe_reason": higher_timeframe.reason,
             "candidate_setup_present": candidate.candidate_setup_present,
             "candidate_reason": candidate.reason,
+            "candidate_score": candidate.candidate_score,
+            "candidate_threshold": candidate.candidate_threshold,
+            "candidate_tier": candidate.candidate_tier,
+            "candidate_stage_flags": candidate.stage_flags or {},
             "quality_filter_reasons": quality_filter_reasons,
             "tool_errors": tool_errors,
             "raw_action": action,
