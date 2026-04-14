@@ -259,6 +259,13 @@ def detect_range_fade_candidate(
     config: dict,
 ) -> CandidateSnapshot:
     setup_family = "range_fade"
+    threshold = float(config.get("bot_range_fade_candidate_score_min", 2.25))
+    empty_stage_flags = {
+        "width_pass": False,
+        "edge_pass": False,
+        "rejection_pass": False,
+        "rr_pass": False,
+    }
     if regime.label != "range" or setup_family not in regime.allowed_setup_families:
         return CandidateSnapshot(
             candidate_setup_present=False,
@@ -271,6 +278,8 @@ def detect_range_fade_candidate(
             reward_risk_estimate=None,
             reclaim_confirmed=False,
             reason=f"Regime {regime.label} does not route to range_fade.",
+            candidate_threshold=threshold,
+            stage_flags=empty_stage_flags,
         )
     if data.empty or len(data) < 55:
         return CandidateSnapshot(
@@ -284,6 +293,8 @@ def detect_range_fade_candidate(
             reward_risk_estimate=None,
             reclaim_confirmed=False,
             reason="Insufficient bars for deterministic range_fade detection.",
+            candidate_threshold=threshold,
+            stage_flags=empty_stage_flags,
         )
 
     frame = _build_feature_frame(data)
@@ -306,11 +317,20 @@ def detect_range_fade_candidate(
             reward_risk_estimate=None,
             reclaim_confirmed=False,
             reason="Range width is invalid for range_fade detection.",
+            candidate_threshold=threshold,
+            stage_flags=empty_stage_flags,
         )
 
     min_width_atr = float(config.get("bot_range_fade_min_width_atr", 1.5))
     max_width_atr = float(config.get("bot_range_fade_max_width_atr", 5.5))
-    if range_width / atr14 < min_width_atr or range_width / atr14 > max_width_atr:
+    width_atr = range_width / atr14
+    stage_flags = {
+        "width_pass": min_width_atr <= width_atr <= max_width_atr,
+        "edge_pass": False,
+        "rejection_pass": False,
+        "rr_pass": False,
+    }
+    if not stage_flags["width_pass"]:
         return CandidateSnapshot(
             candidate_setup_present=False,
             setup_family=setup_family,
@@ -322,12 +342,15 @@ def detect_range_fade_candidate(
             reward_risk_estimate=None,
             reclaim_confirmed=False,
             reason="Detected range width is outside the configured ATR bounds.",
+            candidate_threshold=threshold,
+            stage_flags=stage_flags,
         )
 
     edge_threshold = float(config.get("bot_range_fade_edge_atr_tolerance", 0.55)) * atr14
     stop_buffer = float(config.get("bot_range_fade_stop_buffer_atr", 0.2)) * atr14
     target_buffer = float(config.get("bot_range_fade_target_buffer_atr", 0.35)) * atr14
-    minimum_rr = float(config.get("bot_min_reward_risk", 1.8))
+    minimum_rr = float(config.get("bot_range_fade_rr_research_floor", 0.9))
+    close_location_min = float(config.get("bot_range_fade_rejection_close_location_min", 0.45))
 
     direction = "FLAT"
     entry_zone_low = None
@@ -341,14 +364,33 @@ def detect_range_fade_candidate(
     prev_close = float(frame.iloc[-2]["Close"])
     prev_low = float(frame.iloc[-2]["Low"])
     prev_high = float(frame.iloc[-2]["High"])
+    current_open = float(latest["Open"])
+    current_high = float(latest["High"])
+    current_low = float(latest["Low"])
+    current_bar_range = max(current_high - current_low, 1e-9)
+    close_location = (current_price - current_low) / current_bar_range
 
     if current_price - range_low <= edge_threshold:
         direction = "LONG"
+        stage_flags["edge_pass"] = True
         entry_zone_low = range_low
         entry_zone_high = min(range_low + edge_threshold, range_high)
         invalidation_level = range_low - stop_buffer
         target_reference = range_high - target_buffer
-        reclaim_confirmed = current_price > prev_close and float(latest["Low"]) >= prev_low
+        touched_support = current_low <= range_low + edge_threshold
+        rejection_score = 0.0
+        if current_price > current_open:
+            rejection_score += 1.0
+        if current_price > prev_close:
+            rejection_score += 1.0
+        if close_location >= close_location_min:
+            rejection_score += 1.0
+        if touched_support:
+            rejection_score += 0.5
+        if current_low >= prev_low:
+            rejection_score += 0.5
+        reclaim_confirmed = rejection_score >= 2.0
+        stage_flags["rejection_pass"] = reclaim_confirmed
         risk = current_price - invalidation_level
         reward = target_reference - current_price
         if reclaim_confirmed:
@@ -357,11 +399,26 @@ def detect_range_fade_candidate(
             reason = "Price touched lower range support but rejection confirmation is missing."
     elif range_high - current_price <= edge_threshold:
         direction = "SHORT"
+        stage_flags["edge_pass"] = True
         entry_zone_low = max(range_low, range_high - edge_threshold)
         entry_zone_high = range_high
         invalidation_level = range_high + stop_buffer
         target_reference = range_low + target_buffer
-        reclaim_confirmed = current_price < prev_close and float(latest["High"]) <= prev_high
+        short_close_location = (current_high - current_price) / current_bar_range
+        touched_resistance = current_high >= range_high - edge_threshold
+        rejection_score = 0.0
+        if current_price < current_open:
+            rejection_score += 1.0
+        if current_price < prev_close:
+            rejection_score += 1.0
+        if short_close_location >= close_location_min:
+            rejection_score += 1.0
+        if touched_resistance:
+            rejection_score += 0.5
+        if current_high <= prev_high:
+            rejection_score += 0.5
+        reclaim_confirmed = rejection_score >= 2.0
+        stage_flags["rejection_pass"] = reclaim_confirmed
         risk = invalidation_level - current_price
         reward = current_price - target_reference
         if reclaim_confirmed:
@@ -374,6 +431,7 @@ def detect_range_fade_candidate(
 
     if risk is not None and risk > 0 and reward is not None and reward > 0:
         reward_risk_estimate = reward / risk
+        stage_flags["rr_pass"] = reward_risk_estimate >= minimum_rr
 
     if direction == "FLAT":
         return CandidateSnapshot(
@@ -387,20 +445,38 @@ def detect_range_fade_candidate(
             reward_risk_estimate=None,
             reclaim_confirmed=False,
             reason=reason,
+            candidate_threshold=threshold,
+            stage_flags=stage_flags,
         )
 
-    if not reclaim_confirmed:
+    candidate_score = 0.0
+    if stage_flags["width_pass"]:
+        candidate_score += 1.0
+    if stage_flags["edge_pass"]:
+        candidate_score += 1.0
+    if stage_flags["rejection_pass"]:
+        candidate_score += 1.0
+    if reward_risk_estimate is not None:
+        if reward_risk_estimate >= minimum_rr:
+            candidate_score += 1.0
+        elif reward_risk_estimate >= minimum_rr * 0.8:
+            candidate_score += 0.5
+
+    if not stage_flags["rejection_pass"]:
         final_reason = reason
-    elif reward_risk_estimate is None or reward_risk_estimate < minimum_rr:
+        tier = "weak"
+    elif reward_risk_estimate is None or reward_risk_estimate < minimum_rr * 0.8:
         final_reason = (
             f"Range fade candidate exists but estimated reward-to-risk "
             f"{0.0 if reward_risk_estimate is None else reward_risk_estimate:.2f} is below {minimum_rr:.2f}."
         )
+        tier = "weak"
     else:
         final_reason = "Range fade candidate detected with edge rejection and acceptable estimated RR."
+        tier = "strong" if candidate_score >= threshold + 0.75 else "medium"
 
     return CandidateSnapshot(
-        candidate_setup_present=bool(reclaim_confirmed and reward_risk_estimate is not None and reward_risk_estimate >= minimum_rr),
+        candidate_setup_present=bool(candidate_score >= threshold and stage_flags["rejection_pass"]),
         setup_family=setup_family,
         direction=direction,
         entry_zone_low=entry_zone_low,
@@ -410,6 +486,10 @@ def detect_range_fade_candidate(
         reward_risk_estimate=reward_risk_estimate,
         reclaim_confirmed=reclaim_confirmed,
         reason=final_reason,
+        candidate_score=candidate_score,
+        candidate_threshold=threshold,
+        candidate_tier=tier,
+        stage_flags=stage_flags,
     )
 
 

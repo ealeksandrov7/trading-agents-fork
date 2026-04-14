@@ -42,6 +42,7 @@ from tradingagents.research import (
     BacktestingUnavailableError,
     optimize_backtesting_strategy,
     run_backtesting_strategy,
+    single_run_parameter_overrides,
 )
 from cli.models import AnalystType
 from cli.utils import *
@@ -1676,6 +1677,10 @@ def backtest_strategy(
     commission: float = typer.Option(0.0, "--commission", help="Flat commission rate passed to backtesting.py."),
     optimize: bool = typer.Option(False, "--optimize", help="Run a deterministic parameter sweep instead of a single backtest."),
     maximize: str = typer.Option("Return [%]", "--maximize", help="Metric used to rank optimization runs."),
+    target_r: Optional[float] = typer.Option(None, "--target-r", help="Single-run target R override for deterministic backtests."),
+    expiry_bars: Optional[int] = typer.Option(None, "--expiry-bars", help="Single-run setup expiry override for deterministic backtests."),
+    entry_style: Optional[str] = typer.Option(None, "--entry-style", help="Single-run trend_pullback entry style override."),
+    target_mode: Optional[str] = typer.Option(None, "--target-mode", help="Single-run range_fade target mode override: reference or fixed_r."),
     target_r_values: Optional[str] = typer.Option(None, "--target-r-values", help="Comma-separated target R values for optimization."),
     expiry_values: Optional[str] = typer.Option(None, "--expiry-values", help="Comma-separated setup expiry bar counts for optimization."),
     entry_style_values: Optional[str] = typer.Option(None, "--entry-style-values", help="Comma-separated trend_pullback entry styles: midpoint, near_price, deep_pullback."),
@@ -1695,6 +1700,15 @@ def backtest_strategy(
     config["decision_timeframe"] = timeframe
     config["hyperliquid_testnet"] = testnet
     config["bot_analysis_interval_minutes"] = analysis_interval_minutes
+    config.update(
+        single_run_parameter_overrides(
+            selected_strategy,
+            target_r=target_r,
+            expiry_bars=expiry_bars,
+            entry_style=entry_style,
+            target_mode=target_mode,
+        )
+    )
     executor = HyperliquidExecutor(
         wallet_address=config.get("hyperliquid_wallet_address"),
         private_key=config.get("hyperliquid_private_key"),
@@ -1769,6 +1783,15 @@ def backtest_strategy(
     table.add_row("Candidate bars", str(summary["candidate_bars"]))
     table.add_row("Deterministic actions", str(summary["deterministic_actions"]))
     table.add_row("HTF filter", "enabled" if summary["higher_timeframe_filter_enabled"] else "disabled")
+    if not optimize:
+        if selected_strategy == "range_fade":
+            table.add_row("Target mode", str(config["bot_deterministic_range_fade_target_mode"]))
+            table.add_row("Target R", f"{float(config['bot_deterministic_range_fade_target_r_multiple']):.2f}")
+            table.add_row("Expiry bars", str(int(config["bot_deterministic_range_fade_expiry_bars"])))
+        else:
+            table.add_row("Entry style", str(config["bot_deterministic_trend_pullback_entry_style"]))
+            table.add_row("Target R", f"{float(config['bot_deterministic_trend_pullback_target_r_multiple']):.2f}")
+            table.add_row("Expiry bars", str(int(config["bot_deterministic_trend_pullback_expiry_bars"])))
     console.print(table)
 
     if optimize:

@@ -3,6 +3,7 @@ from .backtesting_harness import (
     build_backtesting_frame,
     optimize_backtesting_strategy,
     run_backtesting_strategy,
+    single_run_parameter_overrides,
 )
 
 __all__ = [
@@ -10,4 +11,5 @@ __all__ = [
     "build_backtesting_frame",
     "optimize_backtesting_strategy",
     "run_backtesting_strategy",
+    "single_run_parameter_overrides",
 ]

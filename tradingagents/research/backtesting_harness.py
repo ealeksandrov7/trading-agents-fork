@@ -567,6 +567,28 @@ def _strategy_parameter_overrides(strategy_name: str, params: dict[str, Any]) ->
     }
 
 
+def single_run_parameter_overrides(
+    strategy_name: str,
+    *,
+    target_r: Optional[float] = None,
+    expiry_bars: Optional[int] = None,
+    entry_style: Optional[str] = None,
+    target_mode: Optional[str] = None,
+) -> dict[str, Any]:
+    params: dict[str, Any] = {}
+    if target_r is not None:
+        params["target_r"] = float(target_r)
+    if expiry_bars is not None:
+        params["expiry_bars"] = int(expiry_bars)
+    if entry_style is not None:
+        params["entry_style"] = str(entry_style).strip().lower()
+    if target_mode is not None:
+        params["target_mode"] = str(target_mode).strip().lower()
+    if not params:
+        return {}
+    return _strategy_parameter_overrides(_normalize_strategy_name(strategy_name), params)
+
+
 def _metric_value(value: Any) -> Optional[float]:
     if value is None:
         return None

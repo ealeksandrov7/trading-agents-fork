@@ -116,8 +116,14 @@ Current supported candidate detectors:
   - regime must already route to range mean reversion
   - recent structure must remain inside a bounded range
   - price must be near a range edge, not mid-range
-  - edge rejection/reversal confirmation must exist
-  - stop and target must fit a favorable reward-to-risk profile
+  - candidate evaluation is now staged and scored rather than purely binary
+  - current stage diagnostics are:
+    - `width_pass`
+    - `edge_pass`
+    - `rejection_pass`
+    - `rr_pass`
+  - rejection quality uses a small score from bar direction, close location, and recent edge interaction
+  - stop and target must still fit a favorable reward-to-risk profile, but RR is now a softer research filter instead of the only hard gate
 
 If `candidate_setup_present=False`, the graph is skipped entirely.
 
@@ -363,6 +369,13 @@ Current defaults:
 - `bot_deterministic_range_fade_target_r_multiple = 2.0`
 - `bot_deterministic_range_fade_expiry_bars = 3`
 
+Current practical interpretation:
+
+- the range-fade detector is intentionally broader than the original textbook-only version
+- edge eligibility and range-width bounds were widened to preserve more valid research samples
+- reversal confirmation is now scored instead of requiring one rigid two-bar pattern
+- this change was made because the earlier range-fade baseline produced only `1-2` trades over multi-week samples, which was too sparse to evaluate credibly
+
 Purpose of these rules:
 
 - create a stable, explicit replay baseline
@@ -554,7 +567,7 @@ Intended meaning:
 Current bot usage:
 
 - `range` regime routes to `range_fade`
-- candidate detection requires an edge touch plus rejection confirmation
+- candidate detection uses staged checks for range width, edge proximity, reversal confirmation, and RR contribution
 - entries should stay near the range boundary and invalidation sits just outside the range
 
 ## Quick Commands
@@ -647,6 +660,34 @@ python cli/main.py backtest-strategy \
   --commission 0.0005 \
   --testnet
 ```
+
+Single-run deterministic override example for `range_fade`:
+
+```bash
+python cli/main.py backtest-strategy \
+  --symbol BTC-USD \
+  --timeframe 1h \
+  --strategy range_fade \
+  --start "2026-01-01 00:00" \
+  --end "2026-04-11 23:00" \
+  --data-source hyperliquid \
+  --analysis-interval-minutes 60 \
+  --cash 10000 \
+  --commission 0.0005 \
+  --target-mode fixed_r \
+  --target-r 1.5 \
+  --expiry-bars 5 \
+  --testnet
+```
+
+Use the single-value flags when you want a quick one-off backtest:
+
+- `--target-mode`
+- `--target-r`
+- `--expiry-bars`
+- `--entry-style`
+
+Use the plural `*-values` flags only with `--optimize`.
 
 Deterministic parameter sweep:
 

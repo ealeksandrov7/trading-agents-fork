@@ -9,6 +9,7 @@ from tradingagents.research.backtesting_harness import (
     build_backtesting_frame_from_bars,
     optimize_backtesting_strategy,
     run_backtesting_strategy,
+    single_run_parameter_overrides,
 )
 
 
@@ -140,6 +141,18 @@ class BacktestingHarnessTests(unittest.TestCase):
         self.assertEqual(result["evaluated"], 4)
         self.assertEqual(result["ranked_results"][0]["params"]["entry_style"], "near_price")
         self.assertEqual(result["ranked_results"][0]["params"]["target_r"], 1.5)
+
+    def test_single_run_parameter_overrides_for_range_fade(self):
+        overrides = single_run_parameter_overrides(
+            "range_fade",
+            target_mode="fixed_r",
+            target_r=1.5,
+            expiry_bars=5,
+        )
+
+        self.assertEqual(overrides["bot_deterministic_range_fade_target_mode"], "fixed_r")
+        self.assertEqual(overrides["bot_deterministic_range_fade_target_r_multiple"], 1.5)
+        self.assertEqual(overrides["bot_deterministic_range_fade_expiry_bars"], 5)
 
 
 if __name__ == "__main__":
